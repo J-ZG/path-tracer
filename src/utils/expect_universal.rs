@@ -1,6 +1,6 @@
 /// On web, [`Result::expect()`] or [`Option::unwrap()`] both aren't recommended.
 ///
-/// Instead, wasm_bindgen's
+/// Instead, [`wasm_bindgen`]'s
 /// [`wasm_bindgen::UnwrapThrowExt::expect_throw`] or
 /// [`wasm_bindgen::UnwrapThrowExt::unwrap_throw`] are recommended,
 /// which throw JavaScript errors.

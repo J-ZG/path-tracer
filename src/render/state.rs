@@ -1,11 +1,13 @@
-//! Define the [`State`] struct, which encapsulates all the GPU resources, scene data, and application state needed for rendering.
+//! Define the [`State`] struct which encapsulates all the GPU resources, scene data, and application state needed for rendering.
+//!
 //! Includes methods for initializing these resources and handling events from the window.
 
 /// The name of the glTF file to load from the [`assets/`](https://github.com/0dpe/path-tracer/tree/main/assets) directory to render.
+///
 /// Can be exported from Blender.
 /// ![Export glTF from Blender 1](https://raw.githubusercontent.com/0dpe/path-tracer/main/doc/blender_export_gltf_1.jpg)
 /// ![Export glTF from Blender 2](https://raw.githubusercontent.com/0dpe/path-tracer/main/doc/blender_export_gltf_2.jpg)
-pub const GLTF: &str = "cornell_custom.glb";
+pub const GLTF: &str = "cornell_custom";
 
 use super::scene;
 
@@ -66,6 +68,10 @@ pub struct State {
     /// Tracks the number of frames rendered since the last camera movement or window resize.
     /// Used for accumulation in the compute shader, where the shader can use this count to determine how many frames have been accumulated so far and adjust its calculations accordingly.
     frame_count: u32,
+
+    /// Used for performance analysis.
+    #[cfg(all(feature = "testing", not(target_arch = "wasm32")))]
+    profiler: wgpu_profiler::GpuProfiler,
 
     /// The winit window.
     pub window: std::sync::Arc<winit::window::Window>,
@@ -188,10 +194,17 @@ impl State {
         //     "Max texture dimension 2D: {}",
         //     supported_limits.max_texture_dimension_2d
         // );
+
+        #[cfg(all(feature = "testing", not(target_arch = "wasm32")))]
+        let required_features =
+            adapter.features() & wgpu_profiler::GpuProfiler::ALL_WGPU_TIMER_FEATURES; // for wgpu_profiler
+        #[cfg(not(all(feature = "testing", not(target_arch = "wasm32"))))]
+        let required_features = wgpu::Features::empty();
+
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("Device"),
-                required_features: wgpu::Features::empty(),
+                required_features,
                 required_limits: wgpu::Limits {
                     max_storage_buffer_binding_size: supported_limits
                         .max_storage_buffer_binding_size, // the default is 128 MiB, which is too small for millions of triangles
@@ -203,6 +216,17 @@ impl State {
                 trace: wgpu::Trace::Off,
             })
             .await?;
+
+        #[cfg(all(feature = "testing", not(target_arch = "wasm32")))]
+        tracy_client::Client::start();
+
+        #[cfg(all(feature = "testing", not(target_arch = "wasm32")))]
+        let profiler = wgpu_profiler::GpuProfiler::new_with_tracy_client(
+            wgpu_profiler::GpuProfilerSettings::default(),
+            adapter.get_info().backend,
+            &device,
+            &queue,
+        )?;
 
         // see which TextureFormat's are supported by the surface
         // Bgra8Unorm and Bgra8UnormSrgb should be guaranteed, but on web, Bgra8UnormSrgb isn't supported it seems
@@ -443,7 +467,7 @@ impl State {
         });
 
         // load and parse a glTF 2.0 file
-        let mut scene = scene::Scene::new(&format!("assets/{}", GLTF)).await?;
+        let mut scene = scene::Scene::new(&format!("assets/{GLTF}.glb")).await?;
         scene.move_camera_to(glam::Vec3::new(0.0, 0.0, 6.0));
 
         // for dragon.glb:
@@ -607,6 +631,9 @@ impl State {
 
             frame_count: 0,
 
+            #[cfg(all(feature = "testing", not(target_arch = "wasm32")))]
+            profiler,
+
             window,
         })
     }
@@ -684,68 +711,103 @@ impl State {
                             label: Some("Encoder"),
                         });
 
-                // compute and render passes
                 {
-                    // this is in a code block because begin_compute_pass() takes a &mut to encoder
-                    let mut compute_pass =
-                        encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                            label: Some("Compute pass"),
+                    // this is in a code block because the &mut to encoder needs to be dropped before profiler.resolve_queries()
+                    #[cfg(all(feature = "testing", not(target_arch = "wasm32")))]
+                    let mut scope = self
+                        .profiler
+                        .scope("Compute and render scope", &mut encoder);
+
+                    // compute pass
+                    {
+                        // this is in a code block because begin_compute_pass() takes a &mut to encoder
+                        #[cfg(all(feature = "testing", not(target_arch = "wasm32")))]
+                        let mut compute_pass = scope.scoped_compute_pass("Compute pass scoped");
+
+                        #[cfg(not(all(feature = "testing", not(target_arch = "wasm32"))))]
+                        let mut compute_pass =
+                            encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                                label: Some("Compute pass"),
+                                timestamp_writes: None,
+                            });
+
+                        compute_pass.set_pipeline(&self.compute_pipeline);
+                        compute_pass.set_bind_group(0, &self.compute_texture_bind_group, &[]); // the u32 passed here, which is 0, matches with @group(0)
+                        compute_pass.set_bind_group(1, &self.compute_scene_bind_group, &[]);
+
+                        let workgroup_size = 8; // matches with @compute @workgroup_size(8, 8, 1)
+                        let workgroup_count_x = self.surface_config.width.div_ceil(workgroup_size); // make sure that the entire texture is covered by 8x8 workgroups, since texture size should always equal surface_config size
+                        let workgroup_count_y = self.surface_config.height.div_ceil(workgroup_size);
+                        compute_pass.dispatch_workgroups(workgroup_count_x, workgroup_count_y, 1);
+                    }
+
+                    // render pass
+                    {
+                        // this is in a code block because begin_compute_pass() takes a &mut to encoder
+                        let render_pass_descriptor = wgpu::RenderPassDescriptor {
+                            label: Some("Render pass"),
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                view: &frame.texture.create_view(&wgpu::TextureViewDescriptor {
+                                    label: Some("Current frame surface texture view"),
+                                    format: Some(self.surface_config.format), // linear gamma
+                                    dimension: Some(wgpu::TextureViewDimension::D2),
+                                    aspect: wgpu::TextureAspect::All,
+                                    base_mip_level: 0,
+                                    mip_level_count: Some(1),
+                                    ..Default::default()
+                                }),
+                                depth_slice: None, // only useful for 3D textures
+                                resolve_target: None,
+                                ops: wgpu::Operations {
+                                    load: wgpu::LoadOp::Load,
+                                    store: wgpu::StoreOp::Store,
+                                },
+                            })],
+                            depth_stencil_attachment: None,
                             timestamp_writes: None,
-                        });
+                            occlusion_query_set: None,
+                            multiview_mask: None,
+                        };
 
-                    compute_pass.set_pipeline(&self.compute_pipeline);
-                    compute_pass.set_bind_group(0, &self.compute_texture_bind_group, &[]); // the u32 passed here, which is 0, matches with @group(0)
-                    compute_pass.set_bind_group(1, &self.compute_scene_bind_group, &[]);
+                        #[cfg(all(feature = "testing", not(target_arch = "wasm32")))]
+                        let mut render_pass =
+                            scope.scoped_render_pass("Render pass scoped", render_pass_descriptor);
 
-                    let workgroup_size = 8; // matches with @compute @workgroup_size(8, 8, 1)
-                    let workgroup_count_x = self.surface_config.width.div_ceil(workgroup_size); // make sure that the entire texture is covered by 8x8 workgroups, since texture size should always equal surface_config size
-                    let workgroup_count_y = self.surface_config.height.div_ceil(workgroup_size);
-                    compute_pass.dispatch_workgroups(workgroup_count_x, workgroup_count_y, 1);
-                }
-                {
-                    // this is in a code block because begin_compute_pass() takes a &mut to encoder
-                    let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("Render pass"),
-                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: &frame.texture.create_view(&wgpu::TextureViewDescriptor {
-                                label: Some("Current frame surface texture view"),
-                                format: Some(self.surface_config.format), // linear gamma
-                                dimension: Some(wgpu::TextureViewDimension::D2),
-                                aspect: wgpu::TextureAspect::All,
-                                base_mip_level: 0,
-                                mip_level_count: Some(1),
-                                ..Default::default()
-                            }),
-                            depth_slice: None, // only useful for 3D textures
-                            resolve_target: None,
-                            ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Load,
-                                store: wgpu::StoreOp::Store,
-                            },
-                        })],
-                        depth_stencil_attachment: None,
-                        timestamp_writes: None,
-                        occlusion_query_set: None,
-                        multiview_mask: None,
-                    });
+                        #[cfg(not(all(feature = "testing", not(target_arch = "wasm32"))))]
+                        let mut render_pass = encoder.begin_render_pass(&render_pass_descriptor);
 
-                    render_pass.set_pipeline(&self.render_pipeline);
-                    render_pass.set_bind_group(0, &self.render_texture_bind_group, &[]);
-                    render_pass.draw(0..3, 0..1); // draw a triangle
+                        render_pass.set_pipeline(&self.render_pipeline);
+                        render_pass.set_bind_group(0, &self.render_texture_bind_group, &[]);
+                        render_pass.draw(0..3, 0..1); // draw a triangle
+                    }
                 }
 
-                self.queue.submit([encoder.finish()]); // CommandEncoder::finish and executed here
+                #[cfg(all(feature = "testing", not(target_arch = "wasm32")))]
+                self.profiler.resolve_queries(&mut encoder);
+
+                self.queue.submit([encoder.finish()]);
+
                 // although everything seems to work without pre_present_notify(), this is encouraged by winit docs
                 // might only matter on Wayland
                 self.window.pre_present_notify();
+
                 frame.present();
+
+                #[cfg(all(feature = "testing", not(target_arch = "wasm32")))]
+                {
+                    if let Err(e) = self.profiler.end_frame() {
+                        log::error!("Failed to end profiler frame: {e:?}");
+                    }
+                    self.profiler
+                        .process_finished_frame(self.queue.get_timestamp_period()); // needed for giving tracy statistics
+                }
             }
 
             wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {}
             wgpu::CurrentSurfaceTexture::Outdated
             | wgpu::CurrentSurfaceTexture::Suboptimal(_)
             | wgpu::CurrentSurfaceTexture::Lost => {
-                // On Windows, fast resizes can cause Outdated error
+                // on Windows, fast resizes can cause Outdated error
                 let size = self.window.inner_size();
                 self.resize(size.width, size.height);
             }
@@ -753,6 +815,9 @@ impl State {
                 log::error!("Validation error in get_current_texture");
             }
         }
+
+        #[cfg(all(feature = "testing", not(target_arch = "wasm32")))]
+        tracy_client::frame_mark();
 
         // this will trigger RedrawRequested event, which is a call to self.update() again, which creates a loop at the vsync rate of the monitor
         self.window.request_redraw();

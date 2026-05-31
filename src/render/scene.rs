@@ -4,6 +4,8 @@
 // on both native and wasm, loading is at runtime
 // this allows the glTF file to change without having to rebuild the WASM
 
+/// The size of each texture atlas in pixels.
+///
 /// 8192 is the default value of [`wgpu::Limits::max_texture_dimension_2d`].
 /// Since passing an array of images with different sizes isn't supported universally,
 /// images are packed into atlases which are larger square images that store multiple smaller images.
@@ -165,7 +167,7 @@ Even putting #[repr(C, align(16))] on this struct does not work
 */
 pub struct GpuCamera {
     /// Camera position and frame count in the 4th value.
-    /// When the camera moves, frame_count is reset to 0, which is used for accumulation.
+    /// When the camera moves, frame count is reset to 0, which is used for accumulation.
     position_and_frame_count: glam::Vec4,
     /// Lower-left pixel coordinate of image plane in world space.
     lower_left_corner: glam::Vec4,
@@ -375,13 +377,13 @@ impl Scene {
             }
 
             // save parsed images for testing
-            #[cfg(all(feature = "testing", not(target_arch = "wasm32")))]
-            Self::save_rgba_image(
-                &format!("parsed_image_{img_idx}.png"),
-                &rgba,
-                image.width,
-                image.height,
-            );
+            // #[cfg(all(feature = "testing", not(target_arch = "wasm32")))]
+            // Self::save_rgba_image(
+            //     &format!("parsed_image_{img_idx}.png"),
+            //     &rgba,
+            //     image.width,
+            //     image.height,
+            // );
 
             let size = guillotiere::size2(image.width.cast_signed(), image.height.cast_signed());
             let mut allocation = None;
@@ -597,7 +599,7 @@ impl Scene {
                                         if t_ortho.length_squared() > f32::EPSILON {
                                             t_ortho = t_ortho.normalize();
                                         } else {
-                                            let up = if n.y.abs() < 1.0 {
+                                            let up = if n.y.abs() < 0.999 { // TODO: check this
                                                 glam::Vec3::Y
                                             } else {
                                                 glam::Vec3::X
@@ -769,7 +771,7 @@ impl Scene {
                 pitch: 0.0,
                 movement_speeds: [(root_aabb.aabb_max.x - root_aabb.aabb_min.x)
                     .max(root_aabb.aabb_max.z - root_aabb.aabb_min.z)
-                    * 0.15; 2],
+                    * 0.25; 2],
             },
         };
 
@@ -1006,10 +1008,13 @@ impl Scene {
         let d = pressed_keys.contains(&winit::keyboard::KeyCode::KeyD);
         let space = pressed_keys.contains(&winit::keyboard::KeyCode::Space);
         let shift = pressed_keys.contains(&winit::keyboard::KeyCode::ShiftLeft);
+        let q = pressed_keys.contains(&winit::keyboard::KeyCode::KeyQ);
 
         if !(w || s || a || d || space || shift) {
             return false;
         }
+
+        let speed_multiplier = if q { 4.0 } else { 1.0 };
 
         let (sin_yaw, cos_yaw) = self.camera.yaw.sin_cos();
 
@@ -1022,17 +1027,22 @@ impl Scene {
         let intent = forward_xz * forward_coeff + right_xz * right_coeff;
 
         let move_xz = if intent.length_squared() > f32::EPSILON {
-            intent.normalize() * horizontal_speed * self.camera.movement_speeds[0]
+            intent.normalize()
+                * horizontal_speed
+                * speed_multiplier
+                * self.camera.movement_speeds[0]
         } else {
             glam::Vec3::ZERO
         };
 
         let vert_dir = (if space { 1.0 } else { 0.0 }) - (if shift { 1.0 } else { 0.0 });
-        let vertical_movement = vert_dir * vertical_speed * self.camera.movement_speeds[1];
+        let vertical_movement =
+            vert_dir * vertical_speed * speed_multiplier * self.camera.movement_speeds[1];
 
         // check if there's any actual movement
         // keys might be pressed but cancel each other out (e.g. W and S)
-        if move_xz.length_squared() <= f32::EPSILON && vertical_movement.abs() <= f32::EPSILON {
+        // == 0.0 instead of <= f32::EPSILON because with tiny scenes, allow very slow movement speeds without it being considered as no movement
+        if move_xz.length_squared() == 0.0 && vertical_movement.abs() == 0.0 {
             return false;
         }
 
@@ -1074,7 +1084,7 @@ impl Scene {
             .clamp(-std::f32::consts::FRAC_PI_2, std::f32::consts::FRAC_PI_2);
     }
 
-    /// Prepare a GpuCamera struct with the current camera parameters, ready to be uploaded to the GPU. The `frame_count` parameter is included in the `position_and_frame_count` field, which can be used in shaders for effects that depend on the number of frames rendered (e.g., accumulation).
+    /// Prepare a struct for the GPU with the current camera parameters. The `frame_count` parameter is included in the `position_and_frame_count` field, which can be used in shaders for effects that depend on the number of frames rendered (e.g., accumulation).
     pub fn prepare_gpu_camera(&self, frame_count: u32) -> GpuCamera {
         let cam = &self.camera;
 

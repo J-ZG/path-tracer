@@ -6,6 +6,9 @@
 // TODO: implement tracing shadow rays for better denoising
 // TODO: dorm scene has weird vertical shading problem
 // TODO: not sure about the math; recheck them
+// TODO: investigate why web performance is much worse than on native
+// TODO: investigate black edges on round models
+// TODO: test if combining the triangle geometry and attributes would be faster
 
 // these structs match with Rust side definitions
 
@@ -194,10 +197,7 @@ fn trace(ray: Ray) -> HitRecord {
                 let ray_cross_edge2 = cross(ray.direction, edge2); // ray_cross_edge2 is perpendicular to ray.direction and edge2
                 let det = dot(edge1, ray_cross_edge2); // det measures how non-parallel the ray is to the plane the triangle is on 
 
-                // no backface culling to allow double-sided materials to work
-                if abs(det) < 0.000001 {
-                    continue; // ray is parallel to the triangle plane, so an intersection is impossible
-                }
+                // testing if abs(det) < 0.000001 here is common to determine if ray is parallel to the triangle plane, but can cause issues with very small triangles
 
                 let inv_det = 1.0 / det;
                 let s = ray.origin - p0;
@@ -209,7 +209,7 @@ fn trace(ray: Ray) -> HitRecord {
                 if v < 0.0 || u + v > 1.0 { continue; }
 
                 let t = dot(edge2, s_cross_edge1) * inv_det;
-                if t > 0.0001 && t < closest_t {
+                if t > 0.0 && t < closest_t {
                     closest_t = t;
                     hit_idx = i32(tri_idx);
                     hit_u = u;
@@ -246,14 +246,15 @@ fn trace(ray: Ray) -> HitRecord {
         let n2 = vec3<f32>(attr.normals[6], attr.normals[7], attr.normals[8]);
         let interp_normal = normalize(w * n0 + hit_u * n1 + hit_v * n2);
 
-        hit_rec.normal = select(interp_normal, -interp_normal, dot(ray.direction, interp_normal) > 0.0); // per glTF spec, normals should be flipped if the ray hits the back face of the triangle; needed for double-sided materials
+        let is_back_face = dot(ray.direction, interp_normal) > 0.0;
+        hit_rec.normal = select(interp_normal, -interp_normal, is_back_face);
 
         let interp_tangent = w * attr.t0 + hit_u * attr.t1 + hit_v * attr.t2;
-        let t_xyz = interp_tangent.xyz;
+        let t_xyz = select(interp_tangent.xyz, -interp_tangent.xyz, is_back_face);
         let t_len_sq = dot(t_xyz, t_xyz);
-        let safe_t_len_sq = max(t_len_sq, 1e-8); // prevent potentially poisoning NaN from evaluating inverseSqrt(0.0) 
+        let safe_t_len_sq = max(t_len_sq, 0.0);
 
-        let valid_t = select(vec3<f32>(1.0, 0.0, 0.0), t_xyz * inverseSqrt(safe_t_len_sq), t_len_sq > 1e-8);
+        let valid_t = select(vec3<f32>(1.0, 0.0, 0.0), t_xyz * inverseSqrt(safe_t_len_sq), t_len_sq > 0.0);
         hit_rec.tangent = vec4<f32>(valid_t, select(-1.0, 1.0, interp_tangent.w >= 0.0));
     }
 
@@ -303,10 +304,30 @@ fn compute_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     for (var bounce = 0; bounce < 20; bounce += 1) {
         let hit = trace(ray);
 
-        // ray escaped the scene, render sky/environment
+        // ray escaped the scene, render sky/environment with colorful debug bands
         if hit.t < 0.0 {
-            let t_bg = 0.5 * (ray.direction.y + 1.0);
-            let sky_color = mix(vec3<f32>(0.05, 0.05, 0.05), vec3<f32>(0.2, 0.3, 0.4), t_bg);
+            // normal sky gradient
+            // let t_bg = 0.5 * (ray.direction.y + 1.0);
+            // let sky_color = mix(vec3<f32>(0.05, 0.05, 0.05), vec3<f32>(0.2, 0.3, 0.4), t_bg);
+
+            let dir_y = ray.direction.y;
+            var sky_color = vec3<f32>(0.0);
+
+            // hard-edged color bands for easy reflection debugging
+            if dir_y > 0.6 {
+                sky_color = vec3<f32>(1.0, 0.0, 0.0); // red (top)
+            } else if dir_y > 0.3 {
+                sky_color = vec3<f32>(0.0, 1.0, 0.0); // green
+            } else if dir_y > 0.0 {
+                sky_color = vec3<f32>(0.0, 0.0, 1.0); // blue
+            } else if dir_y > -0.3 {
+                sky_color = vec3<f32>(1.0, 1.0, 0.0); // yellow
+            } else if dir_y > -0.6 {
+                sky_color = vec3<f32>(1.0, 0.0, 1.0); // magenta
+            } else {
+                sky_color = vec3<f32>(0.0, 1.0, 1.0); // cyan (bottom)
+            }
+
             final_color += throughput * sky_color;
             break;
         }
@@ -353,11 +374,11 @@ fn compute_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
             let T = hit.tangent.xyz;
             let t_ortho_unnorm = T - N * dot(N, T);
             let t_ortho_len_sq = dot(t_ortho_unnorm, t_ortho_unnorm);
-            let safe_t_ortho_len_sq = max(t_ortho_len_sq, 1e-8);
+            let safe_t_ortho_len_sq = max(t_ortho_len_sq, 0.0);
 
-            let fallback_up = select(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 0.0, 1.0), abs(N.z) < 0.999);
+            let fallback_up = select(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 0.0, 1.0), abs(N.z) < 1.0);
             let fallback_t = normalize(cross(fallback_up, N));
-            let T_ortho = select(fallback_t, t_ortho_unnorm * inverseSqrt(safe_t_ortho_len_sq), t_ortho_len_sq > 1e-8);
+            let T_ortho = select(fallback_t, t_ortho_unnorm * inverseSqrt(safe_t_ortho_len_sq), t_ortho_len_sq > 0.0);
 
             // bitangent
             let B = cross(N, T_ortho) * hit.tangent.w;
@@ -367,7 +388,7 @@ fn compute_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         }
 
         let V = -ray.direction;
-        let NdV = max(dot(N, V), 0.0001);
+        let NdV = max(dot(N, V), 0.000000001); // TODO: a tiny value here is needed to prevent black pixels, I don't know why
 
         // Schlick Fresnel approximation
         let F0 = mix(vec3<f32>(0.04), base_color, metallic);
@@ -379,7 +400,7 @@ fn compute_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         var next_dir: vec3<f32>;
         if rand() < p_specular {
             // metallic/specular bounce
-            let alpha = max(0.001, roughness * roughness); // glTF expects alpha = roughness^2
+            let alpha = max(0.0, roughness * roughness); // glTF expects alpha = roughness^2
             let H = ggx_sample_hemisphere(N, alpha);
             next_dir = reflect(-V, H);
 
@@ -389,9 +410,9 @@ fn compute_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
             }
 
             let L = next_dir;
-            let NdotL = max(dot(N, L), 0.0001);
-            let NdotH = max(dot(N, H), 0.0001);
-            let VdotH = max(dot(V, H), 0.0001);
+            let NdotL = max(dot(N, L), 0.0);
+            let NdotH = max(dot(N, H), 0.0);
+            let VdotH = max(dot(V, H), 0.0);
 
             let G = smith_g1(NdV, alpha) * smith_g1(NdotL, alpha);
 
