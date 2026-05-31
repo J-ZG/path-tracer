@@ -19,9 +19,10 @@ pub const ATLAS_SIZE: i32 = 8192;
 // TODO: test against the sample glTFs
 
 /// Contains all the data loaded from a glTF file and formatted for the GPU.
+/// The coordiante system is: +X to the right of the screen, +Y up the screen, and -Z into the screen.
 #[derive(Debug)]
 pub struct Scene {
-    // geometries[i] and attributes[i] together represent a triangle primitive at index i
+    // geometries[i] and attributes[i] together represent a triangle at index i
     // hence, only GpuTriangleAttribute contains material index (geometries doesn't contain any index)
     pub geometries: Vec<GpuTriangleGeometry>,
     pub attributes: Vec<GpuTriangleAttribute>,
@@ -38,7 +39,6 @@ pub struct Scene {
 #[derive(Debug)]
 struct Camera {
     /// Camera position x, y, z in world space.
-    /// The coordiante system is: -z into the screen, +y up the screen, and +x to the right of the screen.
     position: glam::Vec3,
     // focus distance is not needed since this is a pinhole camera; focus distance is implicitly 1
     /// Vertical FOV in degrees.
@@ -51,7 +51,7 @@ struct Camera {
     movement_speeds: [f32; 2],
 }
 
-/// Contains the positions of the three vertices of a triangle primative.
+/// Contains the positions of the three vertices of a triangle.
 // GpuTriangleGeometry and GpuTriangleAttribute are separate structs because the shader fetches vertices much more frequently than normals
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)] // Clone and Copy are required by Pod
@@ -68,7 +68,7 @@ pub struct GpuTriangleGeometry {
     p2: glam::Vec3,
 }
 
-/// Contains the material index and vertex attributes of a triangle primitive.
+/// Contains the material index and vertex attributes of a triangle.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 #[cfg_attr(
@@ -77,9 +77,10 @@ pub struct GpuTriangleGeometry {
 )]
 pub struct GpuTriangleAttribute {
     /// Points to the index of a [`GpuMaterial`] in [`Scene::materials`]; indicates which material this triangle uses.
-    // meshes are not passed to the GPU; instead, individual triangles themselves are passed
-    // each triangle thus has a material index, which indicates which mesh the triangle is from
+    // meshes or primitives are not passed to the GPU; instead, individual triangles themselves are passed; each triangle thus has a material index
     index: u32,
+    // note that these are vertex normals, separate from the normal texture or scale factor in material
+    // vertex normals define the base shape, while the normal texture and scale add finer details on top of the base shape
     /// Normal vector at vertex 0.
     n0: glam::Vec3,
     /// Normal vector at vertex 1.
@@ -108,21 +109,21 @@ pub struct GpuTriangleAttribute {
     derive(serde::Serialize)
 )]
 pub struct GpuMaterial {
-    /// Base color factor in RGBA; applied to the base color texture if it exists. If no texture, the base color is just this factor.
+    /// Base color factor in RGBA; applied as a linear multiplier to the base color texture if it exists. If no texture, the base color is just this factor.
     base_color_factor: glam::Vec4,
-    /// Offset (x, y) and scale (x, y) for the base color texture in an atlas; if no texture, this is zero and ignored in the shader.
+    /// Offset (x, y) and scale (x, y) for the base color texture in an atlas; if no texture, this is zero and should be ignored in the shader.
     base_color_uv: glam::Vec4,
-    /// Offset (x, y) and scale (x, y) for the normal texture in an atlas; if no texture, this is zero and ignored in the shader.
+    /// Offset (x, y) and scale (x, y) for the normal texture in an atlas; if no texture, this is zero and should be ignored in the shader.
     normal_uv: glam::Vec4,
-    /// Offset (x, y) and scale (x, y) for the metallic-roughness texture in an atlas; if no texture, this is zero and ignored in the shader.
+    /// Offset (x, y) and scale (x, y) for the metallic-roughness texture in an atlas; if no texture, this is zero and should be ignored in the shader.
     metallic_roughness_uv: glam::Vec4,
-    /// Offset (x, y) and scale (x, y) for the emissive texture in an atlas; if no texture, this is zero and ignored in the shader.
+    /// Offset (x, y) and scale (x, y) for the emissive texture in an atlas; if no texture, this is zero and should be ignored in the shader.
     emissive_uv: glam::Vec4,
-    /// Emissive color in RGB, and emissive strength in the 4th value; applied to the emissive texture if it exists. If no texture, the emissive color is just this factor.
+    /// Emissive color in RGB, and emissive strength in the 4th value; applied as a linear multiplier to the emissive texture if it exists. If no texture, the emissive color is just this factor.
     emissive: glam::Vec4,
     /// Index into the array of texture atlases for the base color texture; -1 if no texture.
     base_color_tex_layer: i32,
-    /// Scale factor for the normal map.
+    /// Linear scale factor for the normal texture; if no normal texture, this should be ignored.
     normal_scale: f32,
     /// Index into the array of texture atlases for the normal texture; -1 if no texture.
     normal_tex_layer: i32,
@@ -130,9 +131,9 @@ pub struct GpuMaterial {
     metallic_roughness_tex_layer: i32,
     /// Index into the array of texture atlases for the emissive texture; -1 if no texture.
     emissive_tex_layer: i32,
-    /// Metallic factor for the material.
+    /// Metallic factor; a linear multiplier for the metallic value in the metallic-roughness texture if it exists. If no texture, this is the metallic value.
     metallic_factor: f32,
-    /// Roughness factor for the material.
+    /// Roughness factor; a linear multiplier for the roughness value in the metallic-roughness texture if it exists. If no texture, this is the roughness value.
     roughness_factor: f32,
     /// Flag indicating if the material is double-sided; 0 for false, 1 for true.
     double_sided: i32,
@@ -145,13 +146,13 @@ pub struct GpuBvhNode {
     /// Axis-aligned bounding box's minimum of this node.
     aabb_min: glam::Vec3,
     /// If this node is an internal node, this value is the index of the left child node in [`Scene::bvh_nodes`].
-    /// If this node is a leaf ([`Self::prim_count`] is not 0), this value is the starting offset into [`Scene::geometries`] for the primitives contained in this leaf.
+    /// If this node is a leaf ([`Self::tri_count`] is not 0), this value is the starting offset into [`Scene::geometries`] for the triangles contained in this leaf.
     left_first: u32,
     /// Axis-aligned bounding box's maximum of this node.
     aabb_max: glam::Vec3,
-    /// If this node is a leaf, this value is the number of primitives contained in this leaf.
+    /// If this node is a leaf, this value is the number of triangles contained in this leaf.
     /// If this node is an internal node, this value is 0 and [`Self::left_first`] is the index in [`Scene::bvh_nodes`] of this node's left child.
-    prim_count: u32,
+    tri_count: u32,
 }
 
 /// Contains camera data formatted for the GPU; obtained with [`Scene::prepare_gpu_camera()`].
@@ -206,9 +207,48 @@ impl Aabb {
 }
 /// Internal BVH helper struct.
 #[derive(Clone, Copy)]
-struct PrimitiveInfo {
+struct TriangleInfo {
     aabb: Aabb,
     centroid: glam::Vec3,
+}
+
+/// Adapter to use [`mikktspace::Geometry`] for tangent generation if needed.
+struct MikkTSpaceGeometry<'a> {
+    indices: &'a [u32],
+    positions: &'a [glam::Vec3],
+    normals: &'a [glam::Vec3],
+    tex_coords: &'a [glam::Vec2],
+    tangents: &'a mut [glam::Vec4],
+}
+impl mikktspace::Geometry for MikkTSpaceGeometry<'_> {
+    fn num_faces(&self) -> usize {
+        self.indices.len() / 3
+    }
+    fn num_vertices_of_face(&self, _face: usize) -> usize {
+        3
+    }
+    fn position(&self, face: usize, vert: usize) -> [f32; 3] {
+        self.positions[self.indices[face * 3 + vert] as usize].into()
+    }
+    fn normal(&self, face: usize, vert: usize) -> [f32; 3] {
+        if self.normals.is_empty() {
+            let i0 = self.indices[face * 3] as usize;
+            let i1 = self.indices[face * 3 + 1] as usize;
+            let i2 = self.indices[face * 3 + 2] as usize;
+            let p0 = self.positions[i0];
+            let p1 = self.positions[i1];
+            let p2 = self.positions[i2];
+            (p1 - p0).cross(p2 - p0).normalize().into() // calculate flat normals
+        } else {
+            self.normals[self.indices[face * 3 + vert] as usize].into()
+        }
+    }
+    fn tex_coord(&self, face: usize, vert: usize) -> [f32; 2] {
+        self.tex_coords[self.indices[face * 3 + vert] as usize].into()
+    }
+    fn set_tangent_encoded(&mut self, tangent: [f32; 4], face: usize, vert: usize) {
+        self.tangents[face * 3 + vert] = glam::Vec4::from(tangent);
+    }
 }
 
 /// Load a glTF file as bytes, either from the filesystem on native or over HTTP on web.
@@ -252,6 +292,57 @@ async fn load_gltf_bytes(path: &str) -> Result<Vec<u8>, Box<dyn std::error::Erro
     }
 }
 
+/// Convert a glTF material into a [`GpuMaterial`] for passing to the GPU, using the provided mapping of image indices to atlas layers and UV offset/scale.
+// not a closure inside new() because using a function seems to be slightly faster
+fn parse_gpu_material(
+    mat: &gltf::Material,
+    image_uvs: &std::collections::HashMap<usize, (i32, glam::Vec4)>,
+) -> GpuMaterial {
+    let get_layer_and_uv = |img_idx_opt: Option<usize>| -> (i32, glam::Vec4) {
+        img_idx_opt
+            .and_then(|idx| image_uvs.get(&idx).copied())
+            .unwrap_or((-1, glam::Vec4::ZERO)) // return -1 layer and zero UV if no texture attached
+    };
+
+    let pbr = mat.pbr_metallic_roughness();
+
+    let (base_color_tex_layer, base_color_uv) = get_layer_and_uv(
+        pbr.base_color_texture()
+            .map(|t| t.texture().source().index()),
+    );
+    let (metallic_roughness_tex_layer, metallic_roughness_uv) = get_layer_and_uv(
+        pbr.metallic_roughness_texture()
+            .map(|t| t.texture().source().index()),
+    );
+    let norm_tex = mat.normal_texture();
+    let (normal_tex_layer, normal_uv) =
+        get_layer_and_uv(norm_tex.as_ref().map(|t| t.texture().source().index()));
+    let (emissive_tex_layer, emissive_uv) =
+        get_layer_and_uv(mat.emissive_texture().map(|t| t.texture().source().index()));
+
+    GpuMaterial {
+        base_color_factor: glam::Vec4::from(pbr.base_color_factor()),
+        base_color_uv,
+        normal_uv,
+        metallic_roughness_uv,
+        emissive_uv,
+        emissive: glam::Vec4::new(
+            mat.emissive_factor()[0],
+            mat.emissive_factor()[1],
+            mat.emissive_factor()[2],
+            mat.emissive_strength().unwrap_or(1.0),
+        ),
+        base_color_tex_layer,
+        normal_scale: norm_tex.map_or(1.0, |t| t.scale()),
+        normal_tex_layer,
+        metallic_roughness_tex_layer,
+        emissive_tex_layer,
+        metallic_factor: pbr.metallic_factor(),
+        roughness_factor: pbr.roughness_factor(),
+        double_sided: i32::from(mat.double_sided()),
+    }
+}
+
 impl Scene {
     /// Load a glTF file from the given path and format it for the GPU.
     pub async fn new(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
@@ -260,7 +351,7 @@ impl Scene {
         let mut geometries = Vec::new();
         let mut attributes = Vec::new();
         let mut materials = Vec::new();
-        let mut prim_infos = Vec::new();
+        let mut tri_infos = Vec::new();
 
         // the 2 extensions enabled are KHR_materials_emissive_strength and KHR_materials_specular
         // in Blender, with principled BSDF, if emission strength is larger than 1.0, KHR_materials_emissive_strength will automatically be used in the exported glTF file
@@ -269,6 +360,8 @@ impl Scene {
         });
 
         // precompute an 8-bit sRGB to linear lookup table to avoid expensive math per-pixel
+        // TODO: Just hardcode the LUT
+        // TODO: 8 bits isn't enough when converting from sRGB to linear, so consider 12 bits; see https://youtu.be/eWUDoms2iJo?t=240&si=sjInLYsrJn2H6EbX
         let mut srgb_to_linear_lut = [0u8; 256];
         for (i, c) in srgb_to_linear_lut.iter_mut().enumerate() {
             let f = i as f32 / 255.0;
@@ -280,7 +373,7 @@ impl Scene {
             *c = (linear * 255.0).round() as u8;
         }
 
-        // collect indices of images designated as sRGB (base color or emissive textures) per glTF spec
+        // collect indices of images designated as sRGB per glTF spec
         // only base color and emissive textures are sRGB in glTF
         let mut srgb_images = std::collections::HashSet::new();
         for material in document.materials() {
@@ -372,7 +465,7 @@ impl Scene {
                     pixel[0] = srgb_to_linear_lut[pixel[0] as usize];
                     pixel[1] = srgb_to_linear_lut[pixel[1] as usize];
                     pixel[2] = srgb_to_linear_lut[pixel[2] as usize];
-                    // the alpha channel is strictly linear per the glTF spec, so don't modify pixel[3]
+                    // the alpha channel is linear per glTF spec, so don't modify pixel[3]
                 }
             }
 
@@ -438,13 +531,6 @@ impl Scene {
             image_uvs.insert(img_idx, (layer_idx as i32, uv_offset_scale));
         }
 
-        // helper closure to fetch mapping bounds from dictionary
-        let get_layer_and_uv = |img_idx_opt: Option<usize>| -> (i32, glam::Vec4) {
-            img_idx_opt
-                .and_then(|idx| image_uvs.get(&idx).copied())
-                .unwrap_or((-1, glam::Vec4::ZERO)) // return -1 layer and zero UV if no texture attached
-        };
-
         // collect root nodes to begin traversal
         let root_nodes = document.default_scene().map_or_else(
             || document.nodes().collect::<Vec<_>>(),
@@ -457,15 +543,17 @@ impl Scene {
             stack.push((node, glam::Mat4::IDENTITY));
         }
 
+        // used so that primitives with the same material can reuse the same GpuMaterial instead of storing duplicate materials in the Scene
+        let mut material_cache = std::collections::HashMap::new();
+
         // temporary vecs for processing each primitive; declared once here to save on performance of repeated allocations; these are cleared and reused for each primitive
         let mut temp_positions = Vec::new();
         let mut temp_normals = Vec::new();
         let mut temp_tex_coords = Vec::new();
         let mut temp_indices = Vec::new();
         let mut temp_tangents = Vec::new();
-        // if tangents aren't provided, they need to be calculated; these vecs are used for that
-        let mut tan_acc = Vec::new();
-        let mut bitan_acc = Vec::new();
+        // used if tangents are calculated using mikktspace
+        let mut computed_tangents = Vec::new();
 
         // iteratively process all nodes with a stack
         while let Some((node, parent_mat)) = stack.pop() {
@@ -494,9 +582,9 @@ impl Scene {
 
                 // primitives are the only useful data in a gltf::Mesh for this renderer
                 for primitive in mesh.primitives() {
-                    // only process the primitive if it's triangles
+                    // only process the primitive if it has triangles
                     if primitive.mode() == gltf::mesh::Mode::Triangles {
-                        // a reader can read the data of a mesh primitive
+                        // a reader can read the data of a primitive
                         let reader =
                             primitive.reader(|buffer| Some(&buffers[buffer.index()].0[..]));
 
@@ -506,29 +594,8 @@ impl Scene {
                                 it.map(|p| model_mat.transform_point3(glam::Vec3::from_array(p))),
                             );
                         } else {
-                            continue;
-                        } // skip if no vertex positions
-
-                        temp_normals.clear();
-                        if let Some(it) = reader.read_normals() {
-                            temp_normals.extend(it.map(|n| {
-                                normal_mat
-                                    .transform_vector3(glam::Vec3::from_array(n))
-                                    .normalize()
-                            }));
-                        } else {
-                            temp_normals.resize(
-                                temp_positions.len(),
-                                normal_mat.transform_vector3(glam::Vec3::Y).normalize(),
-                            );
+                            continue; // skip if no vertex positions
                         }
-
-                        temp_tex_coords.clear();
-                        if let Some(it) = reader.read_tex_coords(0) {
-                            temp_tex_coords.extend(it.into_f32().map(glam::Vec2::from_array));
-                        } else {
-                            temp_tex_coords.resize(temp_positions.len(), glam::Vec2::ZERO);
-                        } // if there are no tex coords, use (0, 0) for all vertices
 
                         temp_indices.clear();
                         if let Some(it) = reader.read_indices() {
@@ -537,8 +604,26 @@ impl Scene {
                             temp_indices.extend(0..temp_positions.len() as u32);
                         }
 
+                        temp_tex_coords.clear();
+                        if let Some(it) = reader.read_tex_coords(0) {
+                            temp_tex_coords.extend(it.into_f32().map(glam::Vec2::from_array));
+                        } else {
+                            temp_tex_coords.resize(temp_positions.len(), glam::Vec2::ZERO); // if there are no tex coords, use (0, 0) for all vertices
+                        }
+
+                        temp_normals.clear();
+                        if let Some(it) = reader.read_normals() {
+                            temp_normals.extend(it.map(|n| {
+                                normal_mat
+                                    .transform_vector3(glam::Vec3::from_array(n))
+                                    .normalize()
+                            }));
+                        }
+
                         temp_tangents.clear();
-                        if let Some(it) = reader.read_tangents() {
+                        if !temp_normals.is_empty() // per glTF spec, if tangents are provided but normals aren't, the provided tangents should be ignored
+                            && let Some(it) = reader.read_tangents()
+                        {
                             temp_tangents.extend(it.map(|t| {
                                 let t_vec = glam::Vec4::from_array(t);
                                 model_mat
@@ -546,135 +631,80 @@ impl Scene {
                                     .normalize()
                                     .extend(t_vec.w)
                             }));
-                        } else {
-                            // calculate tangents
-
-                            tan_acc.clear();
-                            tan_acc.resize(temp_positions.len(), glam::Vec3::ZERO);
-
-                            bitan_acc.clear();
-                            bitan_acc.resize(temp_positions.len(), glam::Vec3::ZERO);
-
-                            for chunk in temp_indices.chunks_exact(3) {
-                                let (i0, i1, i2) =
-                                    (chunk[0] as usize, chunk[1] as usize, chunk[2] as usize);
-
-                                let p0 = temp_positions[i0];
-                                let p1 = temp_positions[i1];
-                                let p2 = temp_positions[i2];
-                                let uv0 = temp_tex_coords[i0];
-                                let uv1 = temp_tex_coords[i1];
-                                let uv2 = temp_tex_coords[i2];
-
-                                let e1 = p1 - p0;
-                                let e2 = p2 - p0;
-                                let duv1 = uv1 - uv0;
-                                let duv2 = uv2 - uv0;
-
-                                let det = duv1.x.mul_add(duv2.y, -(duv2.x * duv1.y));
-
-                                let (t, b) = if det.abs() > f32::EPSILON {
-                                    let r = 1.0 / det;
-                                    (
-                                        (e1 * duv2.y - e2 * duv1.y) * r,
-                                        (e2 * duv1.x - e1 * duv2.x) * r,
-                                    )
-                                } else {
-                                    (glam::Vec3::ZERO, glam::Vec3::ZERO)
-                                };
-
-                                tan_acc[i0] += t;
-                                tan_acc[i1] += t;
-                                tan_acc[i2] += t;
-                                bitan_acc[i0] += b;
-                                bitan_acc[i1] += b;
-                                bitan_acc[i2] += b;
-                            }
-
-                            // orthogonalize against the world space normals
-                            temp_tangents.extend(
-                                tan_acc.iter().zip(&bitan_acc).zip(&temp_normals).map(
-                                    |((&t, &b), &n)| {
-                                        let mut t_ortho = t - n * n.dot(t);
-                                        if t_ortho.length_squared() > f32::EPSILON {
-                                            t_ortho = t_ortho.normalize();
-                                        } else {
-                                            let up = if n.y.abs() < 0.999 { // TODO: check this
-                                                glam::Vec3::Y
-                                            } else {
-                                                glam::Vec3::X
-                                            };
-                                            t_ortho = n.cross(up).normalize();
-                                        }
-
-                                        let w = if n.cross(t_ortho).dot(b) < 0.0 {
-                                            -1.0
-                                        } else {
-                                            1.0
-                                        };
-                                        t_ortho.extend(w)
-                                    },
-                                ),
-                            );
                         }
 
-                        let material_index = materials.len() as u32;
+                        computed_tangents.clear();
+                        let use_computed_tangents = temp_tangents.is_empty(); // temp_tangents is only populated if both normals and tangents are available in the glb
+
+                        if use_computed_tangents {
+                            // compute tangents with mikktspace
+                            computed_tangents.resize(temp_indices.len(), glam::Vec4::ZERO);
+
+                            mikktspace::generate_tangents(&mut MikkTSpaceGeometry {
+                                indices: &temp_indices,
+                                positions: &temp_positions,
+                                normals: &temp_normals,
+                                tex_coords: &temp_tex_coords,
+                                tangents: &mut computed_tangents,
+                            });
+                        }
 
                         let mat = primitive.material();
-                        let pbr = mat.pbr_metallic_roughness();
 
-                        let (base_color_tex_layer, base_color_uv) = get_layer_and_uv(
-                            pbr.base_color_texture()
-                                .map(|t| t.texture().source().index()),
-                        );
+                        let material_index = if let Some(idx) = mat.index() {
+                            // if idx is already in material_cache, return material_cache[idx]
+                            // note that material_cache stores keys which match the original material index from the glTF file,
+                            // and values which are the corresponding index in the Scene::materials vec for the GpuMaterial
+                            // this allows primitives with the same material to reuse the same GpuMaterial in Scene instead of storing duplicate GpuMaterials
+                            // if idx is not in material_cache, run the closure, which also stores the new index in material_cache since or_insert_with returns &mut material_cache[idx]
+                            *material_cache.entry(idx).or_insert_with(|| {
+                                let new_idx = materials.len() as u32;
+                                materials.push(parse_gpu_material(&mat, &image_uvs));
+                                new_idx
+                            })
+                        } else {
+                            // if there's no index, caching is impossible, so just parse the material and push it to the materials vec without caching
+                            let new_idx = materials.len() as u32;
+                            materials.push(parse_gpu_material(&mat, &image_uvs));
+                            new_idx
+                        };
 
-                        let (metallic_roughness_tex_layer, metallic_roughness_uv) =
-                            get_layer_and_uv(
-                                pbr.metallic_roughness_texture()
-                                    .map(|t| t.texture().source().index()),
-                            );
-
-                        let norm_tex = mat.normal_texture();
-                        let (normal_tex_layer, normal_uv) = get_layer_and_uv(
-                            norm_tex.as_ref().map(|t| t.texture().source().index()),
-                        );
-
-                        let (emissive_tex_layer, emissive_uv) = get_layer_and_uv(
-                            mat.emissive_texture().map(|t| t.texture().source().index()),
-                        );
-
-                        materials.push(GpuMaterial {
-                            base_color_factor: glam::Vec4::from(pbr.base_color_factor()),
-                            base_color_uv,
-                            normal_uv,
-                            metallic_roughness_uv,
-                            emissive_uv,
-                            emissive: glam::Vec4::new(
-                                mat.emissive_factor()[0],
-                                mat.emissive_factor()[1],
-                                mat.emissive_factor()[2],
-                                mat.emissive_strength().unwrap_or(1.0), // not sure about if this should be 1.0 or 0.0
-                            ),
-                            base_color_tex_layer,
-                            normal_scale: norm_tex.map_or(1.0, |t| t.scale()),
-                            normal_tex_layer,
-                            metallic_roughness_tex_layer,
-                            emissive_tex_layer,
-                            metallic_factor: pbr.metallic_factor(),
-                            roughness_factor: pbr.roughness_factor(),
-                            double_sided: i32::from(mat.double_sided()),
-                        });
-
-                        for chunk in temp_indices.chunks_exact(3) {
-                            let (i0, i1, i2) =
-                                (chunk[0] as usize, chunk[1] as usize, chunk[2] as usize);
+                        for (tri, chunk) in temp_indices.chunks_exact(3).enumerate() {
+                            let [i0, i1, i2] =
+                                [chunk[0] as usize, chunk[1] as usize, chunk[2] as usize];
 
                             let p0 = temp_positions[i0];
                             let p1 = temp_positions[i1];
                             let p2 = temp_positions[i2];
 
-                            // calculate AABB and centroid for the BVH builder
-                            prim_infos.push(PrimitiveInfo {
+                            let (n0, n1, n2) = if temp_normals.is_empty() {
+                                let n = (p1 - p0).cross(p2 - p0).normalize(); // calculate flat normal
+                                (n, n, n)
+                            } else {
+                                (temp_normals[i0], temp_normals[i1], temp_normals[i2])
+                            };
+
+                            let (mut t0, mut t1, mut t2) = if use_computed_tangents {
+                                let base = tri * 3;
+                                (
+                                    computed_tangents[base],
+                                    computed_tangents[base + 1],
+                                    computed_tangents[base + 2],
+                                )
+                            } else {
+                                (temp_tangents[i0], temp_tangents[i1], temp_tangents[i2])
+                            };
+
+                            // per glTF spec, if a triangle's tangents' w values are not the same, the triangle's tangent space is considered undefined
+                            #[allow(clippy::float_cmp)]
+                            if t0.w != t1.w || t0.w != t2.w {
+                                t0 = glam::Vec4::ZERO;
+                                t1 = glam::Vec4::ZERO;
+                                t2 = glam::Vec4::ZERO;
+                            }
+
+                            // calculate AABB and centroid of this triangle for the BVH builder
+                            tri_infos.push(TriangleInfo {
                                 aabb: Aabb {
                                     min: p0.min(p1).min(p2),
                                     max: p0.max(p1).max(p2),
@@ -686,15 +716,15 @@ impl Scene {
 
                             attributes.push(GpuTriangleAttribute {
                                 index: material_index,
-                                n0: temp_normals[i0],
-                                n1: temp_normals[i1],
-                                n2: temp_normals[i2],
+                                n0,
+                                n1,
+                                n2,
                                 uv0: temp_tex_coords[i0],
                                 uv1: temp_tex_coords[i1],
                                 uv2: temp_tex_coords[i2],
-                                t0: temp_tangents[i0],
-                                t1: temp_tangents[i1],
-                                t2: temp_tangents[i2],
+                                t0,
+                                t1,
+                                t2,
                             });
                         }
                     } else {
@@ -714,7 +744,7 @@ impl Scene {
             aabb_min: glam::Vec3::ZERO,
             left_first: 0,
             aabb_max: glam::Vec3::ZERO,
-            prim_count: 0,
+            tri_count: 0,
         }];
 
         log::info!(
@@ -727,17 +757,17 @@ impl Scene {
         let bvh_construction_start = web_time::Instant::now();
 
         // start recursive BVH construction
-        if !prim_infos.is_empty() {
-            let prim_count = prim_infos.len();
-            Self::update_node_bounds(0, &mut bvh_nodes, &prim_infos, 0, prim_count);
+        if !tri_infos.is_empty() {
+            let tri_count = tri_infos.len();
+            Self::update_node_bounds(0, &mut bvh_nodes, &tri_infos, 0, tri_count);
             Self::subdivide(
                 0,
                 &mut bvh_nodes,
-                &mut prim_infos,
+                &mut tri_infos,
                 &mut geometries,
                 &mut attributes,
                 0,
-                prim_count,
+                tri_count,
             );
         }
 
@@ -795,12 +825,12 @@ impl Scene {
     fn update_node_bounds(
         node_idx: usize,
         nodes: &mut [GpuBvhNode],
-        prim_infos: &[PrimitiveInfo],
+        tri_infos: &[TriangleInfo],
         start: usize,
         end: usize,
     ) {
         let mut aabb = Aabb::new();
-        for info in &prim_infos[start..end] {
+        for info in &tri_infos[start..end] {
             aabb.union(&info.aabb);
         }
         nodes[node_idx].aabb_min = aabb.min;
@@ -808,27 +838,27 @@ impl Scene {
     }
 
     /// Recursive binning SAH sub-divider.
-    /// `node_idx` is the index of the current node in `nodes`, and `start` and `end` specify the range of primitives in `prim_infos`, `geometries`, and `attributes` that this node spans.
+    /// `node_idx` is the index of the current node in `nodes`, and `start` and `end` specify the range of triangles in `tri_infos`, `geometries`, and `attributes` that this node spans.
     fn subdivide(
         node_idx: usize,
         nodes: &mut Vec<GpuBvhNode>,
-        prim_infos: &mut [PrimitiveInfo],
+        tri_infos: &mut [TriangleInfo],
         geometries: &mut [GpuTriangleGeometry],
         attributes: &mut [GpuTriangleAttribute],
         start: usize,
         end: usize,
     ) {
-        let prim_count = end - start;
+        let tri_count = end - start;
         // if there are 2 or fewer triangles, make this node a leaf; otherwise, keep subdividing
-        if prim_count <= 2 {
+        if tri_count <= 2 {
             nodes[node_idx].left_first = start as u32;
-            nodes[node_idx].prim_count = prim_count as u32;
+            nodes[node_idx].tri_count = tri_count as u32;
             return;
         }
 
         // split based on not the edges of triangles; calculate bounding box that encapsulates only the centroids
         let mut centroid_bounds = Aabb::new();
-        for info in &prim_infos[start..end] {
+        for info in &tri_infos[start..end] {
             centroid_bounds.grow(info.centroid);
         }
 
@@ -844,7 +874,7 @@ impl Scene {
             #[allow(clippy::float_cmp)] // there should be no precision drift here
             if bounds_min == bounds_max {
                 continue;
-            } // all primitive centroids are overlapping on this axis
+            } // all triangle centroids are overlapping on this axis
 
             let scale = BINS as f32 / (bounds_max - bounds_min);
 
@@ -858,7 +888,7 @@ impl Scene {
                 bounds: Aabb::new(),
             }; BINS];
 
-            for info in &prim_infos[start..end] {
+            for info in &tri_infos[start..end] {
                 let centroid = info.centroid[axis];
                 let mut bin_idx = ((centroid - bounds_min) * scale) as usize;
                 bin_idx = bin_idx.min(BINS - 1);
@@ -904,16 +934,15 @@ impl Scene {
             let e = nodes[node_idx].aabb_max - nodes[node_idx].aabb_min;
             e.z.mul_add(e.x, e.x.mul_add(e.y, e.y * e.z)) // omitting 2.0 coefficient
         };
-        let leaf_cost = prim_count as f32 * node_area;
+        let leaf_cost = tri_count as f32 * node_area;
 
         // if making it a leaf is cheaper than the best SAH split, terminate here
         if best_cost >= leaf_cost {
             nodes[node_idx].left_first = start as u32;
-            nodes[node_idx].prim_count = prim_count as u32;
+            nodes[node_idx].tri_count = tri_count as u32;
             return;
         }
 
-        // partitioning primitives, geometries, and attributes arrays in place
         let bounds_min = centroid_bounds.min[best_axis];
         let bounds_max = centroid_bounds.max[best_axis];
         let scale = BINS as f32 / (bounds_max - bounds_min);
@@ -922,14 +951,14 @@ impl Scene {
         let mut right = end - 1;
 
         while left <= right {
-            let centroid = prim_infos[left].centroid[best_axis];
+            let centroid = tri_infos[left].centroid[best_axis];
             let mut bin_idx = ((centroid - bounds_min) * scale) as usize;
             bin_idx = bin_idx.min(BINS - 1);
 
             if bin_idx <= best_split {
                 left += 1;
             } else {
-                prim_infos.swap(left, right);
+                tri_infos.swap(left, right);
                 geometries.swap(left, right);
                 attributes.swap(left, right);
                 if right == 0 {
@@ -944,7 +973,7 @@ impl Scene {
         // edge case: floats caused a weird partition leaving one side completely empty
         if split_idx == start || split_idx == end {
             nodes[node_idx].left_first = start as u32;
-            nodes[node_idx].prim_count = prim_count as u32;
+            nodes[node_idx].tri_count = tri_count as u32;
             return;
         }
 
@@ -954,26 +983,26 @@ impl Scene {
             aabb_min: glam::Vec3::ZERO,
             left_first: 0,
             aabb_max: glam::Vec3::ZERO,
-            prim_count: 0,
+            tri_count: 0,
         });
         let right_child_idx = nodes.len();
         nodes.push(GpuBvhNode {
             aabb_min: glam::Vec3::ZERO,
             left_first: 0,
             aabb_max: glam::Vec3::ZERO,
-            prim_count: 0,
+            tri_count: 0,
         });
 
         nodes[node_idx].left_first = left_child_idx as u32;
-        nodes[node_idx].prim_count = 0; // 0 signals non-leaf internal node
+        nodes[node_idx].tri_count = 0; // 0 signals non-leaf internal node
 
-        Self::update_node_bounds(left_child_idx, nodes, prim_infos, start, split_idx);
-        Self::update_node_bounds(right_child_idx, nodes, prim_infos, split_idx, end);
+        Self::update_node_bounds(left_child_idx, nodes, tri_infos, start, split_idx);
+        Self::update_node_bounds(right_child_idx, nodes, tri_infos, split_idx, end);
 
         Self::subdivide(
             left_child_idx,
             nodes,
-            prim_infos,
+            tri_infos,
             geometries,
             attributes,
             start,
@@ -982,7 +1011,7 @@ impl Scene {
         Self::subdivide(
             right_child_idx,
             nodes,
-            prim_infos,
+            tri_infos,
             geometries,
             attributes,
             split_idx,

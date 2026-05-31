@@ -9,6 +9,20 @@ fn benchmark_scene_loading(c: &mut Criterion) {
                 .expect("Failed to load scene")
         });
     });
+
+    c.bench_function("scene_mc", |b| {
+        b.iter(|| {
+            pollster::block_on(Scene::new(black_box("assets/mc.glb")))
+                .expect("Failed to load scene")
+        });
+    });
+
+    c.bench_function("scene_dragon", |b| {
+        b.iter(|| {
+            pollster::block_on(Scene::new(black_box("assets/dragon.glb")))
+                .expect("Failed to load scene")
+        });
+    });
 }
 
 criterion_group!(benches, benchmark_scene_loading);

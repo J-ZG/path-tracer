@@ -8,11 +8,13 @@
 // TODO: not sure about the math; recheck them
 // TODO: investigate why web performance is much worse than on native
 // TODO: investigate black edges on round models
-// TODO: test if combining the triangle geometry and attributes would be faster
+
+// 21.23ms 21.2ms 15.36μs at 800x600 dorm_light for compute and render scope, compute pass scoped, and render pass scoped
 
 // these structs match with Rust side definitions
 
 // GpuTriangleGeometry and GpuTriangleAttribute are separate structs just because the shader fetches vertices much more frequently than normals
+// although, actual benchmarks show that the performance difference is negligible, so they could be combined into one struct, but would require more padding, so they're kept separate for now
 struct GpuTriangleGeometry {
     coords: array<f32, 9>, // 3 vertices with x, y, z for each vertex
     // stored as a flat array since vec3<T> has alignment of 16 bytes, which misaligns with Rust's glam::Vec3 which has alignment of 12 bytes
@@ -20,6 +22,7 @@ struct GpuTriangleGeometry {
     // the extra code like
     // p0 = vec3<f32>(tri.coords[0], tri.coords[1], tri.coords[2])
     // should be optimized by the compiler and not cause a performance difference
+    // benchmarks show that using a flat array vs vec3 doesn't cause a performance difference
 };
 struct GpuTriangleAttribute {
     index: u32, // index into the GpuMaterial
@@ -39,6 +42,7 @@ struct BvhNode {
     prim_count: u32,
 }
 
+// see Rust code for more detailed comments
 struct GpuMaterial {
     base_color_factor: vec4<f32>,
     base_color_uv: vec4<f32>, // offset_x, offset_y, scale_x, scale_y
@@ -47,8 +51,6 @@ struct GpuMaterial {
     emissive_uv: vec4<f32>,
     emissive: vec4<f32>, // r, g, b, strength
     base_color_tex_layer: i32, // index the array of texture atlases for this texture; -1 if no texture; same goes for the other texture layers
-    // per glTF spec, if both base_color_factor and texture are present, base_color_factor acts as a multiplier with the texture; this works similarly for the other factors too
-    // the base color texture and emissive texture in glTF are the only textures in sRGB; they're already converted to linear in Rust, so gamma correction isn't needed in the shader
     normal_scale: f32,
     normal_tex_layer: i32,
     metallic_roughness_tex_layer: i32,
@@ -62,9 +64,9 @@ struct GpuMaterial {
 struct GpuCamera {
     position_and_frame_count: vec4<f32>, // camera position, 4th value is the frame_count for accumulation
     // in Rust, frame_count resets to zero when the camera pans or moves
-    lower_left_corner: vec4<f32>, // lower-left pixel coordinate of image plane in world space
-    horizontal: vec4<f32>, // vector that spans the full x of image plane in world space
-    vertical: vec4<f32>, // vector that spans the full y of image plane in world space
+    lower_left_corner: vec4<f32>,
+    horizontal: vec4<f32>,
+    vertical: vec4<f32>,
 };
 
 @group(0) @binding(0) var screen: texture_storage_2d<rgba16float, write>;

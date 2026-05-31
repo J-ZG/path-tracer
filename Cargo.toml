@@ -43,6 +43,7 @@ bytemuck = { version = "1.25.0", features = ["derive"] }
 glam = { version = "0.33.0", features = ["bytemuck", "serde"] }
 web-time = "1.1.0"
 guillotiere = "0.7.0"
+mikktspace = { version = "0.3.0", default-features = false, features = ["glam"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 console_error_panic_hook = "0.1.7"

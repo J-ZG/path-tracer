@@ -18,6 +18,7 @@ clippy --all-targets --all-features --
 -A clippy::must_use_candidate
 -A clippy::missing_errors_doc
 -A clippy::missing_panics_doc
+-A clippy::many_single_char_names
 """
 rr = "run --release"
 t = "run --features testing"
