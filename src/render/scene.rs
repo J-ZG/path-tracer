@@ -10,7 +10,7 @@
 /// Since passing an array of images with different sizes isn't supported universally,
 /// images are packed into atlases which are larger square images that store multiple smaller images.
 /// Then, an array of atlases are passed to the GPU without problems.
-pub const ATLAS_SIZE: i32 = 8192;
+pub const ATLAS_SIZE: u32 = 8192;
 
 // TODO: set atlas size dynamically; if one atlas is enough, use a smaller atlas size; if multiple are needed, use 8192
 
@@ -390,7 +390,10 @@ impl Scene {
             pixels: Vec<u8>,
         }
         let mut atlases = vec![AtlasLayer {
-            allocator: guillotiere::AtlasAllocator::new(guillotiere::size2(ATLAS_SIZE, ATLAS_SIZE)),
+            allocator: guillotiere::AtlasAllocator::new(guillotiere::size2(
+                ATLAS_SIZE as i32,
+                ATLAS_SIZE as i32,
+            )),
             pixels: vec![0; (ATLAS_SIZE * ATLAS_SIZE * 4) as usize], // * 4 for RGBA
         }];
 
@@ -495,7 +498,8 @@ impl Scene {
             if allocation.is_none() {
                 let mut new_layer = AtlasLayer {
                     allocator: guillotiere::AtlasAllocator::new(guillotiere::size2(
-                        ATLAS_SIZE, ATLAS_SIZE,
+                        ATLAS_SIZE as i32,
+                        ATLAS_SIZE as i32,
                     )),
                     pixels: vec![0; (ATLAS_SIZE * ATLAS_SIZE * 4) as usize],
                 };
@@ -513,7 +517,8 @@ impl Scene {
                 let src_start = (y * image.width.cast_signed() * 4) as usize;
                 let src_end = src_start + (image.width.cast_signed() * 4) as usize;
 
-                let dst_start = ((rect.min.y + y) * ATLAS_SIZE * 4 + rect.min.x * 4) as usize;
+                let dst_start =
+                    ((rect.min.y + y) * ATLAS_SIZE as i32 * 4 + rect.min.x * 4) as usize;
                 let dst_end = dst_start + (image.width.cast_signed() * 4) as usize;
 
                 layer.pixels[dst_start..dst_end].copy_from_slice(&rgba[src_start..src_end]);
@@ -527,7 +532,6 @@ impl Scene {
                 image.height as f32 / ATLAS_SIZE as f32, // scale y
             );
 
-            #[allow(clippy::cast_possible_wrap)]
             image_uvs.insert(img_idx, (layer_idx as i32, uv_offset_scale));
         }
 
@@ -647,6 +651,14 @@ impl Scene {
                                 tex_coords: &temp_tex_coords,
                                 tangents: &mut computed_tangents,
                             });
+
+                            // invert the w (sign) component of the computed tangents
+                            // see these two samples to verify that this invert works:
+                            // https://github.com/KhronosGroup/glTF-Sample-Assets/blob/main/Models/NormalTangentMirrorTest/README.md
+                            // https://github.com/KhronosGroup/glTF-Sample-Assets/blob/main/Models/NormalTangentTest/README.md
+                            for t in &mut computed_tangents {
+                                t.w = -t.w;
+                            }
                         }
 
                         let mat = primitive.material();
@@ -805,18 +817,14 @@ impl Scene {
             },
         };
 
-        #[cfg(all(feature = "testing", not(target_arch = "wasm32")))]
-        {
-            for (idx, pixels) in scene.texture_atlases.iter().enumerate() {
-                Self::save_rgba_image(
-                    &format!("atlas_{idx}.png"),
-                    pixels,
-                    ATLAS_SIZE as u32,
-                    ATLAS_SIZE as u32,
-                );
-            }
-            scene.save_scene_data_json();
-        }
+        // save atlas images and scene data for testing
+        // #[cfg(all(feature = "testing", not(target_arch = "wasm32")))]
+        // {
+        //     for (idx, pixels) in scene.texture_atlases.iter().enumerate() {
+        //         Self::save_rgba_image(&format!("atlas_{idx}.png"), pixels, ATLAS_SIZE, ATLAS_SIZE);
+        //     }
+        //     scene.save_scene_data_json();
+        // }
 
         Ok(scene)
     }
@@ -1142,6 +1150,7 @@ impl Scene {
 
     /// Save the scene data (geometries, attributes, materials) to a YAML file in the `debug_output/` directory at the crate root. This is only compiled when the `testing` feature is enabled and the target architecture is not wasm32, as file system access is not available in WebAssembly.
     #[cfg(all(feature = "testing", not(target_arch = "wasm32")))]
+    #[allow(dead_code)]
     fn save_scene_data_json(&self) {
         #[derive(serde::Serialize)]
         struct IndexedGeometry {
@@ -1234,6 +1243,7 @@ impl Scene {
 
     /// Save a texture atlas as a PNG image in the `debug_output/` directory at the crate root. This is only compiled when the `testing` feature is enabled and the target architecture is not wasm32, as file system access is not available in WebAssembly.
     #[cfg(all(feature = "testing", not(target_arch = "wasm32")))]
+    #[allow(dead_code)]
     fn save_rgba_image(filename: &str, pixels: &[u8], width: u32, height: u32) {
         // create debug_output directory in the crate root
         let mut output_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));

@@ -474,14 +474,12 @@ impl State {
         // scene.move_camera_to(glam::Vec3::new(-4.0, 0.2, 0.0));
         // scene.rotate_camera_to(-std::f32::consts::FRAC_PI_2, 0.0);
 
-        const ATLAS_SIZE: u32 = scene::ATLAS_SIZE as u32;
-
         // create texture array from atlases
         let texture_atlas = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Texture atlas array"),
             size: wgpu::Extent3d {
-                width: ATLAS_SIZE,
-                height: ATLAS_SIZE,
+                width: scene::ATLAS_SIZE,
+                height: scene::ATLAS_SIZE,
                 depth_or_array_layers: scene.texture_atlases.len() as u32,
             },
             mip_level_count: 1,
@@ -508,12 +506,12 @@ impl State {
                 atlas_data,
                 wgpu::TexelCopyBufferLayout {
                     offset: 0,
-                    bytes_per_row: Some(ATLAS_SIZE * 4),
-                    rows_per_image: Some(ATLAS_SIZE),
+                    bytes_per_row: Some(scene::ATLAS_SIZE * 4),
+                    rows_per_image: Some(scene::ATLAS_SIZE),
                 },
                 wgpu::Extent3d {
-                    width: ATLAS_SIZE,
-                    height: ATLAS_SIZE,
+                    width: scene::ATLAS_SIZE,
+                    height: scene::ATLAS_SIZE,
                     depth_or_array_layers: 1,
                 },
             );

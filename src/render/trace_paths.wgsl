@@ -2,14 +2,16 @@
 // implements a basic path tracer with support for diffuse and metallic/specular materials, normal interpolation, emissive materials, etc.
 // supports texture maps for base color, metallic/roughness, normal, emissive
 
-// TODO: double_sided is never actually used
-// TODO: implement tracing shadow rays for better denoising
-// TODO: dorm scene has weird vertical shading problem
-// TODO: not sure about the math; recheck them
+// TODO: implement tracing shadow rays for better denoising, avoid fireflies, also multiple importance sampling? 
 // TODO: investigate why web performance is much worse than on native
 // TODO: investigate black edges on round models
 
-// 21.23ms 21.2ms 15.36μs at 800x600 dorm_light for compute and render scope, compute pass scoped, and render pass scoped
+// 20ms 20ms 15μs at 800x600 dorm_light for compute and render scope, compute pass scoped, and render pass scoped
+
+const PI = 3.14159265359f;
+const MAX_BOUNCES = 20u;
+const ZERO_THRESHOLD = 1e-5f;
+const MAX_F32 = 0x1.fffffep+127f; // max float value IEEE-754 binary32
 
 // these structs match with Rust side definitions
 
@@ -59,6 +61,7 @@ struct GpuMaterial {
     roughness_factor: f32,
     double_sided: i32, // 0 for false, 1 for true; used to conditionally enable backface culling
     // when true, the back-face must have its normals reversed before the lighting is evaluated
+    // TODO: double_sided is never actually used; currently, every material is treated as double-sided
 };
 
 struct GpuCamera {
@@ -82,15 +85,7 @@ struct GpuCamera {
 struct Ray {
     origin: vec3<f32>, // camera origin position in world space
     direction: vec3<f32>, // normalized, direction going from camera origin to a point on the image plane
-};
-
-struct HitRecord {
-    t: f32, // distance along the ray where a triangle is hit
-    p: vec3<f32>, // world space point where the ray intersects a triangle
-    material_index: u32,
-    uv: vec2<f32>,   // interpolated triangle UV
-    normal: vec3<f32>,
-    tangent: vec4<f32>, // xyz and sign
+    direction_reciprocal: vec3<f32>, // precomputed reciprocal of direction for faster ray-box intersection; this optimization seems to barely improves performance, but it's common
 };
 
 // PCG random number generator
@@ -104,170 +99,13 @@ fn init_rand(invocation_id: vec3<u32>, frame_count: u32) {
 }
 fn pcg_hash() -> u32 {
     seed = seed * 747796405u + 2891336453u;
-    var word: u32 = ((seed >> ((seed >> 28u) + 4u)) ^ seed) * 277803737u;
+    var word = ((seed >> ((seed >> 28u) + 4u)) ^ seed) * 277803737u;
     return (word >> 22u) ^ word;
 }
+// get random f32 in [0, 1)
+// even with multiple rand() calls with the same invocation_id and frame_count, each call still produces a different random value
 fn rand() -> f32 {
-    return f32(pcg_hash()) / 4294967296.0;
-}
-
-// importance sampling functions
-
-fn get_tangent_space(n: vec3<f32>) -> mat3x3<f32> {
-    let up = select(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 0.0, 1.0), abs(n.z) < 0.999);
-    let t = normalize(cross(up, n));
-    let b = cross(n, t);
-    return mat3x3<f32>(t, b, n);
-}
-
-// diffuse cosine-weighted hemisphere sampling
-fn cosine_sample_hemisphere(n: vec3<f32>) -> vec3<f32> {
-    let r1 = rand();
-    let r2 = rand();
-    let phi = 2.0 * 3.14159265 * r1;
-    let r = sqrt(r2);
-    let x = cos(phi) * r;
-    let y = sin(phi) * r;
-    let z = sqrt(max(0.0, 1.0 - r2));
-    return get_tangent_space(n) * vec3<f32>(x, y, z);
-}
-
-// specular GGX hemisphere sampling
-fn ggx_sample_hemisphere(n: vec3<f32>, alpha: f32) -> vec3<f32> {
-    let r1 = rand();
-    let r2 = rand();
-    let phi = 2.0 * 3.14159265 * r1;
-    let cosTheta = sqrt((1.0 - r2) / (1.0 + (alpha * alpha - 1.0) * r2));
-    let sinTheta = sqrt(max(0.0, 1.0 - cosTheta * cosTheta));
-    let x = cos(phi) * sinTheta;
-    let y = sin(phi) * sinTheta;
-    let z = cosTheta;
-    return get_tangent_space(n) * vec3<f32>(x, y, z);
-}
-
-// BVH traversal to find closest ray-triangle intersection; returns a HitRecord with t < 0 if no hit
-fn trace(ray: Ray) -> HitRecord {
-    var closest_t = 1.0e+20;
-    var hit_idx: i32 = -1;
-    var hit_u: f32 = 0.0;
-    var hit_v: f32 = 0.0;
-
-    // fixed-size stack for BVH traversal (depth 64 is sufficient for millions of primitives)
-    var stack: array<u32, 64>;
-    var stack_ptr: u32 = 0u;
-
-    // push root node
-    stack[stack_ptr] = 0u;
-    stack_ptr += 1u;
-
-    while stack_ptr > 0u {
-        // pop node
-        stack_ptr -= 1u;
-        let node_idx = stack[stack_ptr];
-        let node = bvh_nodes[node_idx];
-
-        // ray-AABB intersection (slab method)
-        let inv_dir = 1.0 / ray.direction; // https://www.w3.org/TR/WGSL/#differences-from-ieee754 division by zero naturally results in infinity, which works with AABB math
-
-        let t0 = (node.aabb_min - ray.origin) * inv_dir;
-        let t1 = (node.aabb_max - ray.origin) * inv_dir;
-
-        let tmin = min(t0, t1);
-        let tmax = max(t0, t1);
-
-        let t_near = max(max(tmin.x, tmin.y), tmin.z);
-        let t_far = min(min(tmax.x, tmax.y), tmax.z);
-
-        // if ray misses the bounding box or is further than the closest hit, skip it
-        if !(t_near <= t_far && t_far > 0.0 && t_near < closest_t) {
-            continue;
-        }
-
-        if node.prim_count > 0u { // leaf node; intersect with primitives
-            for (var i = 0u; i < node.prim_count; i += 1u) {
-                let tri_idx = node.left_first + i;
-
-                // Möller–Trumbore algorithm
-                // implementation based on https://w.wiki/y6d
-                let tri = triangles_geo[tri_idx];
-                let p0 = vec3<f32>(tri.coords[0], tri.coords[1], tri.coords[2]);
-                let p1 = vec3<f32>(tri.coords[3], tri.coords[4], tri.coords[5]);
-                let p2 = vec3<f32>(tri.coords[6], tri.coords[7], tri.coords[8]);
-                let edge1 = p1 - p0; // two edges spanning the triangle
-                let edge2 = p2 - p0;
-
-                let ray_cross_edge2 = cross(ray.direction, edge2); // ray_cross_edge2 is perpendicular to ray.direction and edge2
-                let det = dot(edge1, ray_cross_edge2); // det measures how non-parallel the ray is to the plane the triangle is on 
-
-                // testing if abs(det) < 0.000001 here is common to determine if ray is parallel to the triangle plane, but can cause issues with very small triangles
-
-                let inv_det = 1.0 / det;
-                let s = ray.origin - p0;
-                let u = dot(s, ray_cross_edge2) * inv_det;
-                if u < 0.0 || u > 1.0 { continue; }
-
-                let s_cross_edge1 = cross(s, edge1);
-                let v = dot(ray.direction, s_cross_edge1) * inv_det;
-                if v < 0.0 || u + v > 1.0 { continue; }
-
-                let t = dot(edge2, s_cross_edge1) * inv_det;
-                if t > 0.0 && t < closest_t {
-                    closest_t = t;
-                    hit_idx = i32(tri_idx);
-                    hit_u = u;
-                    hit_v = v;
-                }
-            }
-        } else { // internal node; push children onto stack
-            // left_first contains the index of the left child; right child is contiguous at left_first + 1
-            stack[stack_ptr] = node.left_first + 1u; // push right
-            stack_ptr += 1u;
-            stack[stack_ptr] = node.left_first;      // push left
-            stack_ptr += 1u;
-        }
-    }
-
-    var hit_rec: HitRecord;
-    hit_rec.t = -1.0;
-
-    if hit_idx != -1 {
-        let attr = triangles_attr[u32(hit_idx)];
-
-        hit_rec.t = closest_t;
-        hit_rec.p = ray.direction * closest_t + ray.origin; // this matches f(x) = m * x + b, but in this case in 3D, f(x) outputs a vec3 point, which is the intersection point
-        hit_rec.material_index = attr.index;
-
-        // only 2 barycentric coordinates are given, but we know that the point is valid inside the triangle so all coordinates must sum to 1
-        // so, the third barycentric coordinate can just be computed
-        let w = 1.0 - hit_u - hit_v;
-
-        hit_rec.uv = w * attr.uv0 + hit_u * attr.uv1 + hit_v * attr.uv2;
-
-        let n0 = vec3<f32>(attr.normals[0], attr.normals[1], attr.normals[2]);
-        let n1 = vec3<f32>(attr.normals[3], attr.normals[4], attr.normals[5]);
-        let n2 = vec3<f32>(attr.normals[6], attr.normals[7], attr.normals[8]);
-        let interp_normal = normalize(w * n0 + hit_u * n1 + hit_v * n2);
-
-        let is_back_face = dot(ray.direction, interp_normal) > 0.0;
-        hit_rec.normal = select(interp_normal, -interp_normal, is_back_face);
-
-        let interp_tangent = w * attr.t0 + hit_u * attr.t1 + hit_v * attr.t2;
-        let t_xyz = select(interp_tangent.xyz, -interp_tangent.xyz, is_back_face);
-        let t_len_sq = dot(t_xyz, t_xyz);
-        let safe_t_len_sq = max(t_len_sq, 0.0);
-
-        let valid_t = select(vec3<f32>(1.0, 0.0, 0.0), t_xyz * inverseSqrt(safe_t_len_sq), t_len_sq > 0.0);
-        hit_rec.tangent = vec4<f32>(valid_t, select(-1.0, 1.0, interp_tangent.w >= 0.0));
-    }
-
-    return hit_rec;
-}
-
-// Smith G1 function
-fn smith_g1(NdotV: f32, alpha: f32) -> f32 {
-    let alpha_sq = alpha * alpha;
-    let NdotV_sq = NdotV * NdotV;
-    return 2.0 * NdotV / (NdotV + sqrt(alpha_sq + (1.0 - alpha_sq) * NdotV_sq));
+    return f32(pcg_hash()) * bitcast<f32>(0x2f800004u); // slightly faster than dividing by 4294967296.0
 }
 
 @compute @workgroup_size(8, 8, 1)
@@ -284,176 +122,360 @@ fn compute_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let frame_count = u32(camera.position_and_frame_count.w);
     init_rand(global_id, frame_count);
 
-    // subpixel jitter for anti-aliasing (TAA)
-    let jitter = vec2<f32>(rand() - 0.5, rand() - 0.5);
     // convert the x and y on the texture/surface to normalized values between 0 and 1
-    // + vec2<f32>(0.5) to realign each texel to the center of the texel 
-    let uv = (vec2<f32>(global_id.xy) + vec2<f32>(0.5) + jitter) / screen_dims;
+    // + vec2<f32> with rand() enables subpixel jitter for anti-aliasing (TAA)
+    let pixel_uv = (vec2<f32>(global_id.xy) + vec2<f32>(rand(), rand())) / screen_dims;
 
-    // create a Ray with origin at camera and direction to a given image plane point
-    // the image plane point is defined by uv, which has x and y normalized to 0 to 1
+    // create a Ray with origin at camera and direction to the given image plane point
     var ray: Ray;
     ray.origin = camera.position_and_frame_count.xyz;
     // normalized vector going from camera origin to the image plane coordinate in world space
     ray.direction = normalize(
-        camera.lower_left_corner.xyz + uv.x * camera.horizontal.xyz + uv.y * camera.vertical.xyz - ray.origin
+        camera.lower_left_corner.xyz + pixel_uv.x * camera.horizontal.xyz + pixel_uv.y * camera.vertical.xyz - ray.origin
     );
+    ray.direction_reciprocal = 1.0 / ray.direction;
 
     var throughput = vec3<f32>(1.0, 1.0, 1.0);
     var final_color = vec3<f32>(0.0, 0.0, 0.0);
 
     // path tracing loop
-    for (var bounce = 0; bounce < 20; bounce += 1) {
-        let hit = trace(ray);
+    for (var bounce = 0u; bounce < MAX_BOUNCES; bounce += 1u) {
+        var closest_t = MAX_F32;
+        var hit_index = -1;
+        var hit_v = 0.0;
+        var hit_w = 0.0;
 
-        // ray escaped the scene, render sky/environment with colorful debug bands
-        if hit.t < 0.0 {
-            // normal sky gradient
-            // let t_bg = 0.5 * (ray.direction.y + 1.0);
-            // let sky_color = mix(vec3<f32>(0.05, 0.05, 0.05), vec3<f32>(0.2, 0.3, 0.4), t_bg);
+        // watertight ray setup (hoisted out of BVH loop)
 
-            let dir_y = ray.direction.y;
-            var sky_color = vec3<f32>(0.0);
+        // find the dominant axis of the ray direction
+        let abs_d = abs(ray.direction);
+        let max_xy = max(abs_d.x, abs_d.y);
+        let kz = select(
+            select(0u, 1u, abs_d.y > abs_d.x),
+            2u,
+            abs_d.z > max_xy
+        );
 
-            // hard-edged color bands for easy reflection debugging
-            if dir_y > 0.6 {
-                sky_color = vec3<f32>(1.0, 0.0, 0.0); // red (top)
-            } else if dir_y > 0.3 {
-                sky_color = vec3<f32>(0.0, 1.0, 0.0); // green
-            } else if dir_y > 0.0 {
-                sky_color = vec3<f32>(0.0, 0.0, 1.0); // blue
-            } else if dir_y > -0.3 {
-                sky_color = vec3<f32>(1.0, 1.0, 0.0); // yellow
-            } else if dir_y > -0.6 {
-                sky_color = vec3<f32>(1.0, 0.0, 1.0); // magenta
-            } else {
-                sky_color = vec3<f32>(0.0, 1.0, 1.0); // cyan (bottom)
+        // compute permutation indices to preserve winding order
+        let next_dim = array<u32, 3>(1u, 2u, 0u);
+        let prev_dim = array<u32, 3>(2u, 0u, 1u);
+        let kx_val = next_dim[kz];
+        let ky_val = prev_dim[kz];
+        let is_neg = ray.direction[kz] < 0.0;
+
+        let kx = select(kx_val, ky_val, is_neg);
+        let ky = select(ky_val, kx_val, is_neg);
+
+        // calculate shear constants
+        let Sz = 1.0 / ray.direction[kz];
+        let Sx = -ray.direction[kx] * Sz;
+        let Sy = -ray.direction[ky] * Sz;
+
+        // fixed-size stack for BVH traversal (depth 64 is sufficient for millions of primitives)
+        var stack: array<u32, 64>;
+        var stack_ptr = 0u;
+
+        // push root node
+        stack[stack_ptr] = 0u;
+        stack_ptr += 1u;
+
+        // BVH traversal
+        while stack_ptr > 0u {
+            // pop node
+            stack_ptr -= 1u;
+            let node = bvh_nodes[stack[stack_ptr]];
+
+            // ray-AABB intersection (slab method)
+
+            let t0 = (node.aabb_min - ray.origin) * ray.direction_reciprocal;
+            let t1 = (node.aabb_max - ray.origin) * ray.direction_reciprocal;
+
+            let tmin = min(t0, t1);
+            let tmax = max(t0, t1);
+
+            let t_near = max(max(tmin.x, tmin.y), tmin.z);
+            let t_far = min(min(tmax.x, tmax.y), tmax.z);
+
+            // if ray misses the bounding box or is further than the closest hit, skip it
+            if !(t_near <= t_far && t_far > 0.0 && t_near < closest_t) {
+                continue;
             }
 
-            final_color += throughput * sky_color;
-            break;
+            if node.prim_count > 0u { // leaf node; intersect with primitives
+                for (var i = 0u; i < node.prim_count; i += 1u) {
+                    let tri_index = node.left_first + i;
+                    let tri = triangles_geo[tri_index];
+
+                    let p0 = vec3<f32>(tri.coords[0], tri.coords[1], tri.coords[2]);
+                    let p1 = vec3<f32>(tri.coords[3], tri.coords[4], tri.coords[5]);
+                    let p2 = vec3<f32>(tri.coords[6], tri.coords[7], tri.coords[8]);
+
+                    // watertight ray-triangle intersection using the method from "Watertight Ray/Triangle Intersection" by Woop, Benthin, and Wald (2013)
+                    // more robust than Möller–Trumbore, and also slightly faster
+                    // see https://jcgt.org/published/0002/01/05/paper.pdf
+
+                    // calculate vertices relative to the ray origin
+                    let A = p0 - ray.origin;
+                    let B = p1 - ray.origin;
+                    let C = p2 - ray.origin;
+
+                    // perform shear and scale of vertices
+                    let Ax = A[kx] + Sx * A[kz]; let Ay = A[ky] + Sy * A[kz];
+                    let Bx = B[kx] + Sx * B[kz]; let By = B[ky] + Sy * B[kz];
+                    let Cx = C[kx] + Sx * C[kz]; let Cy = C[ky] + Sy * C[kz];
+
+                    // calculate scaled barycentric coordinates
+                    let U = Cx * By - Cy * Bx;
+                    let V = Ax * Cy - Ay * Cx;
+                    let W = Bx * Ay - By * Ax;
+
+                    // if the signs of U, V, and W are mixed, the ray misses the triangle
+                    let min_UVW = min(U, min(V, W));
+                    let max_UVW = max(U, max(V, W));
+                    if min_UVW < 0.0 && max_UVW > 0.0 {
+                        continue;
+                    }
+
+                    // calculate determinant
+                    let det = U + V + W;
+                    if det == 0.0 {
+                        continue;
+                    }
+
+                    // calculate scaled Z coordinates and the hit distance t
+                    let Az = Sz * A[kz];
+                    let Bz = Sz * B[kz];
+                    let Cz = Sz * C[kz];
+                    let inv_det = 1.0 / det;
+                    let t = (U * Az + V * Bz + W * Cz) * inv_det;
+
+                    if t > 0.0 && t < closest_t {
+                        closest_t = t;
+                        hit_index = i32(tri_index);
+
+                        hit_v = V * inv_det;
+                        hit_w = W * inv_det;
+                    }
+                }
+            } else { // internal node; push children onto stack
+                // left_first contains the index of the left child; right child is contiguous at left_first + 1
+                stack[stack_ptr] = node.left_first + 1u; // push right
+                stack_ptr += 1u;
+                stack[stack_ptr] = node.left_first;      // push left
+                stack_ptr += 1u;
+            }
         }
 
-        let mat = materials[hit.material_index];
+        // ray escaped the scene, render sky color and terminate
+        if hit_index == -1 {
+            // normal sky gradient
+            let sky_color = mix(vec3<f32>(0.05, 0.05, 0.05), vec3<f32>(0.2, 0.3, 0.4), 0.5 * (ray.direction.y + 1.0));
 
-        var base_color = mat.base_color_factor.rgb;
+            // hard-edged color bands for easy reflection debugging
+            // let dir_y = ray.direction.y;
+            // var sky_color = vec3<f32>(0.0);
+            // if dir_y > 0.6 {
+            //     sky_color = vec3<f32>(1.0, 0.0, 0.0); // red (top)
+            // } else if dir_y > 0.3 {
+            //     sky_color = vec3<f32>(0.0, 1.0, 0.0); // green
+            // } else if dir_y > 0.0 {
+            //     sky_color = vec3<f32>(0.0, 0.0, 1.0); // blue
+            // } else if dir_y > -0.3 {
+            //     sky_color = vec3<f32>(1.0, 1.0, 0.0); // yellow
+            // } else if dir_y > -0.6 {
+            //     sky_color = vec3<f32>(1.0, 0.0, 1.0); // magenta
+            // } else {
+            //     sky_color = vec3<f32>(0.0, 1.0, 1.0); // cyan (bottom)
+            // }
+
+            final_color += throughput * sky_color;
+            break; // terminate this ray; this pixel's final color is now determined
+        }
+
+        let attr = triangles_attr[u32(hit_index)];
+        let mat = materials[attr.index];
+
+        // only 2 barycentric coordinates are given, but we know that the point is valid inside the triangle so all coordinates must sum to 1
+        // so, the third barycentric coordinate can just be computed as 1 - (v + w)
+        let hit_u = 1.0 - hit_v - hit_w;
+        let interpolated_uv = hit_u * attr.uv0 + hit_v * attr.uv1 + hit_w * attr.uv2;
+
+        var base_color = mat.base_color_factor.rgb; // TODO: rgba textures are not supported yet
         if mat.base_color_tex_layer >= 0 {
-            let bc_uv = mat.base_color_uv.xy + hit.uv * mat.base_color_uv.zw;
-            let base_color_tex = textureSampleLevel(texture_atlas, atlas_sampler, bc_uv, i32(mat.base_color_tex_layer), 0.0);
+            let base_color_tex = textureSampleLevel(
+                texture_atlas,
+                atlas_sampler,
+                mat.base_color_uv.xy + interpolated_uv * mat.base_color_uv.zw,
+                mat.base_color_tex_layer,
+                0.0
+            );
             base_color = base_color_tex.rgb * mat.base_color_factor.rgb;
         }
 
         var metallic = mat.metallic_factor;
         var roughness = mat.roughness_factor;
         if mat.metallic_roughness_tex_layer >= 0 {
-            let mr_uv = mat.metallic_roughness_uv.xy + hit.uv * mat.metallic_roughness_uv.zw;
-            let mr_tex = textureSampleLevel(texture_atlas, atlas_sampler, mr_uv, i32(mat.metallic_roughness_tex_layer), 0.0);
+            let mr_tex = textureSampleLevel(
+                texture_atlas,
+                atlas_sampler,
+                mat.metallic_roughness_uv.xy + interpolated_uv * mat.metallic_roughness_uv.zw,
+                mat.metallic_roughness_tex_layer,
+                0.0
+            );
             roughness *= mr_tex.g;
             metallic *= mr_tex.b;
         }
 
         var emissive_color = mat.emissive.rgb;
         if mat.emissive_tex_layer >= 0 {
-            let e_uv = mat.emissive_uv.xy + hit.uv * mat.emissive_uv.zw;
-            let emissive_tex = textureSampleLevel(texture_atlas, atlas_sampler, e_uv, i32(mat.emissive_tex_layer), 0.0);
+            let emissive_tex = textureSampleLevel(
+                texture_atlas,
+                atlas_sampler,
+                mat.emissive_uv.xy + interpolated_uv * mat.emissive_uv.zw,
+                mat.emissive_tex_layer,
+                0.0
+            );
             emissive_color *= emissive_tex.rgb;
         }
         final_color += throughput * (emissive_color * mat.emissive.w);
 
-        let N_geom = hit.normal;
-        var N = hit.normal;
+        let n0 = vec3<f32>(attr.normals[0], attr.normals[1], attr.normals[2]);
+        let n1 = vec3<f32>(attr.normals[3], attr.normals[4], attr.normals[5]);
+        let n2 = vec3<f32>(attr.normals[6], attr.normals[7], attr.normals[8]);
+        let interpolated_n = normalize(hit_u * n0 + hit_v * n1 + hit_w * n2);
+
+        let is_back_face = dot(ray.direction, interpolated_n) > 0.0; // false if the ray hits the front face
+        let hit_n = select(interpolated_n, -interpolated_n, is_back_face);
+        var N = hit_n;
+
+        // TODO: tangents can be zero if given tangents' w don't match for the same triangle; not sure what that does to the shader code
+
+        let interpolated_tangent = vec4<f32>(normalize(hit_u * attr.t0.xyz + hit_v * attr.t1.xyz + hit_w * attr.t2.xyz), attr.t0.w);
+        let hit_tangent = select(interpolated_tangent, -interpolated_tangent, is_back_face);
+
+        // Gram-Schmidt orthogonalization
+        let T = normalize(hit_tangent.xyz - N * dot(N, hit_tangent.xyz));
+
+        let B = normalize(cross(N, T) * hit_tangent.w); // bitangent according to glTF
 
         if mat.normal_tex_layer >= 0 {
-            let n_uv = mat.normal_uv.xy + hit.uv * mat.normal_uv.zw;
-            let normal_tex = textureSampleLevel(texture_atlas, atlas_sampler, n_uv, i32(mat.normal_tex_layer), 0.0);
+            let normal_tex = textureSampleLevel(
+                texture_atlas,
+                atlas_sampler,
+                mat.normal_uv.xy + interpolated_uv * mat.normal_uv.zw,
+                mat.normal_tex_layer,
+                0.0
+            );
 
-            // re-range [0, 1] mapped texture back to [-1, 1] vector
-            var local_n = normal_tex.xyz * 2.0 - 1.0;
+            // re-range from [0, 1] RGB to [-1, 1] vector space
+            // https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html#_material_normaltextureinfo_scale
+            var local_n = normal_tex.rgb * 2.0 - 1.0; // in WGSL, vec - scalar works component-wise as intended; see https://www.w3.org/TR/WGSL/#arithmetic-expr
 
-            local_n = vec3<f32>(local_n.xy * mat.normal_scale, local_n.z);
-            local_n = normalize(local_n);
+            local_n = normalize(vec3<f32>(local_n.xy * mat.normal_scale, local_n.z));
 
-            let T = hit.tangent.xyz;
-            let t_ortho_unnorm = T - N * dot(N, T);
-            let t_ortho_len_sq = dot(t_ortho_unnorm, t_ortho_unnorm);
-            let safe_t_ortho_len_sq = max(t_ortho_len_sq, 0.0);
-
-            let fallback_up = select(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 0.0, 1.0), abs(N.z) < 1.0);
-            let fallback_t = normalize(cross(fallback_up, N));
-            let T_ortho = select(fallback_t, t_ortho_unnorm * inverseSqrt(safe_t_ortho_len_sq), t_ortho_len_sq > 0.0);
-
-            // bitangent
-            let B = cross(N, T_ortho) * hit.tangent.w;
-
-            let tbn = mat3x3<f32>(T_ortho, B, N);
-            N = normalize(tbn * local_n);
+            let TBN = mat3x3<f32>(T, B, N);
+            N = normalize(TBN * local_n);
         }
 
-        let V = -ray.direction;
-        let NdV = max(dot(N, V), 0.000000001); // TODO: a tiny value here is needed to prevent black pixels, I don't know why
+        let V = -ray.direction; // view vector
 
-        // Schlick Fresnel approximation
+        let NdotV = max(dot(N, V), ZERO_THRESHOLD);
+
+        // reflection color at normal incidence; for dielectrics, this is usually around 4%, while for metals, this is the base color
         let F0 = mix(vec3<f32>(0.04), base_color, metallic);
-        let F = F0 + (1.0 - F0) * pow(1.0 - NdV, 5.0);
+        // estimate Fresnel at view angle to probabilistically decide diffuse or specular bounce
+        let F_view = F0 + (1.0 - F0) * pow(1.0 - NdotV, 5.0);
+        // probability clamped between 10% and 90%
+        let p_specular = clamp(max(F_view.x, max(F_view.y, F_view.z)), 0.1, 0.9);
 
-        // probability of choosing a metallic/specular bounce vs a diffuse bounce
-        let p_specular = clamp((F.x + F.y + F.z) / 3.0, 0.1, 0.9);
+        let rand1 = rand();
+        let rand2 = rand();
 
-        var next_dir: vec3<f32>;
+        var next_ray_dir: vec3<f32>;
+
         if rand() < p_specular {
             // metallic/specular bounce
-            let alpha = max(0.0, roughness * roughness); // glTF expects alpha = roughness^2
-            let H = ggx_sample_hemisphere(N, alpha);
-            next_dir = reflect(-V, H);
 
-            // invalidate if bounce heads under the surface
-            if dot(next_dir, N_geom) <= 0.0 || dot(next_dir, N) <= 0.0 {
-                break;
-            }
+            let alpha = roughness * roughness; // glTF expects alpha = roughness^2
+            let theta = atan(alpha * sqrt(rand1) / sqrt(1.0 - rand1));
+            let phi = 2.0 * PI * rand2;
+            let H_ts = vec3<f32>(sin(theta) * cos(phi), sin(theta) * sin(phi), cos(theta));
+            let H = normalize(T * H_ts.x + B * H_ts.y + N * H_ts.z);
 
-            let L = next_dir;
+            let L = reflect(-V, H);
+            next_ray_dir = L;
+
             let NdotL = max(dot(N, L), 0.0);
-            let NdotH = max(dot(N, H), 0.0);
-            let VdotH = max(dot(V, H), 0.0);
 
-            let G = smith_g1(NdV, alpha) * smith_g1(NdotL, alpha);
+            if NdotL > 0.0 && dot(hit_n, L) > 0.0 {
+                let VdotH = max(dot(V, H), 0.0);
 
-            let spec_weight = F * (G * VdotH) / (NdV * NdotH);
+                // how much light is reflected at this specific micro-angle
+                let F = F0 + (1.0 - F0) * pow(1.0 - VdotH, 5.0);
 
-            throughput *= spec_weight / p_specular;
+                // Schlick-GGX model with Smith approximation
+                let k = alpha / 2.0;
+                let G1_V = NdotV / (NdotV * (1.0 - k) + k);
+                let G1_L = NdotL / (NdotL * (1.0 - k) + k);
+                let G = G1_V * G1_L;
+
+                // Cook-Torrance specular and PDF
+                let spec_weight = (F * G * VdotH) / max(NdotV * max(dot(N, H), 0.0), ZERO_THRESHOLD);
+
+                // divide by the probability to conserve energy
+                throughput *= spec_weight / p_specular;
+            } else {
+                throughput = vec3<f32>(0.0);
+            }
         } else {
             // diffuse bounce
-            next_dir = cosine_sample_hemisphere(N);
 
-            // invalidate if bounce heads under the surface
-            if dot(next_dir, N_geom) <= 0.0 {
-                break;
+            let r = sqrt(rand1);
+            let phi = 2.0 * PI * rand2;
+            let L_ts = vec3<f32>(r * cos(phi), r * sin(phi), sqrt(1.0 - rand1));
+
+            // transform light direction into world space
+            let L = normalize(T * L_ts.x + B * L_ts.y + N * L_ts.z);
+            next_ray_dir = L;
+
+            if dot(hit_n, L) > 0.0 {
+                // half vector
+                let H = normalize(V + L);
+
+                let F = F0 + (1.0 - F0) * pow(1.0 - max(dot(V, H), 0.0), 5.0);
+
+                let diff_weight = base_color * (1.0 - metallic) * (1.0 - F);
+
+                throughput *= diff_weight / (1.0 - p_specular);
+            } else {
+                throughput = vec3<f32>(0.0);
             }
-
-            let diffuse_albedo = base_color * (1.0 - metallic);
-            throughput *= diffuse_albedo / (1.0 - p_specular);
         }
 
-        // offset ray slightly to prevent self-intersection shadowing (shadow acne)
-        ray.origin = hit.p + N_geom * max(1e-4, 1e-4 * length(hit.p));
-        ray.direction = next_dir;
-
         // russian roulette: terminate paths early if they contribute very little light
-        if bounce > 2 {
-            let p_survive = clamp(max(throughput.x, max(throughput.y, throughput.z)), 0.1, 0.95);
+        if bounce > 2u { // don't start terminating until after a few bounces to allow light to bounce around and contribute meaningfully
+            let p_survive = clamp(max(throughput.x, max(throughput.y, throughput.z)), 0.05, 0.95);
             if rand() > p_survive {
                 break;
             }
             throughput /= p_survive;
         }
+
+        // this matches f(x) = m * x + b, but in this case in 3D, f(x) outputs a vec3 point, which is the intersection point
+        let hit_p = ray.direction * closest_t + ray.origin;
+
+        // offset ray origin slightly to prevent self-intersection shadowing (shadow acne)
+        ray.origin = hit_p + N * max(1e-4, 1e-4 * length(hit_p));
+        ray.direction = next_ray_dir;
+        ray.direction_reciprocal = 1.0 / ray.direction;
     }
 
     // blend current frame into accumulation buffer
     let pixel_idx = global_id.y * u32(screen_dims.x) + global_id.x;
     var accumulated = vec3<f32>(0.0);
 
-    // frame_count resets to 0 when the camera moves, but is then incremented every frame no matter if the camera moves
-    // so the first frame after a camera move will have frame_count of 1, and only from the second frame onwards can we be sure that the accumulation buffer has valid data to blend with
+    // frame_count resets to 0 when the camera moves, but the increment happens after the reset, so frame count can never be zero in the shader
+    // only from the second frame onward can we be sure that the accumulation buffer has valid data to blend with
     if frame_count > 1u {
         accumulated = accumulation_buffer[pixel_idx].rgb;
     }
@@ -462,6 +484,5 @@ fn compute_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     accumulation_buffer[pixel_idx] = vec4<f32>(accumulated, 1.0);
 
     // average out result
-    let display_color = accumulated / f32(frame_count + 1u);
-    textureStore(screen, global_id.xy, vec4<f32>(display_color, 1.0));
+    textureStore(screen, global_id.xy, vec4<f32>(accumulated / f32(frame_count), 1.0)); // frame count is always at least 1
 }
