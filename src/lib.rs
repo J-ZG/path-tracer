@@ -1,40 +1,35 @@
-#![doc = include_str!("../README.md")]
+#![cfg_attr(doc, doc = include_str!("../README.md"))]
+#![allow(clippy::expect_used)]
+#![allow(clippy::panic)]
 
-pub mod render; // pub just for the benchmark
-mod utils;
-
-use render::state::State;
-use utils::expect_universal::ExpectUniversal;
-
-// not supported because testing inlcudes saving images to disk
+// not supported because testing includes saving images to disk
 #[cfg(all(feature = "testing", target_arch = "wasm32"))]
 compile_error!("feature `testing` is not supported on wasm32");
 
+// TODO: investigate why web performance is much worse than on native
+
+pub mod render;
+// pub for criterion benchmark since criterion is an external crate
+use render::state::State;
+
+mod logger;
+
 /// The main function that runs the app, called by both native and web targets.
-// if target_arch is wasm32, apply wasm_bindgen(start)
-// this cfg_attr done because wasm_bindgen dependency isn't in scope for non-wasm
 // wasm_bindgen(start) marks the first function that gets executed when this code, converted to wasm, is loaded into the browser
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(start))]
 pub fn run() {
-    #[cfg(not(target_arch = "wasm32"))]
-    env_logger::init();
-
-    #[cfg(target_arch = "wasm32")]
-    {
-        console_error_panic_hook::set_once();
-        console_log::init_with_level(log::Level::Info).expect_universal("Console log failed"); // the hierarchy of log is: Error Warn Info Debug Trace
-    }
-
-    // running on the web, this will show since console_log was initialized with level Info
-    // running natively, this won't show in the terminal by default, but in ../.cargo/config.toml, Info level is set so this will show
-    // if needed, to explicitly let the terminal show up to Info level:
-    // On MacOS or Linux: RUST_LOG=info cargo run
-    // In PowerShell: $env:RUST_LOG="info"; cargo run
+    logger::init_environment(log::LevelFilter::Info);
     log::info!("Logging enabled");
+
+    // general style guide: all logging should be capitalized, while compile_error!() panic!() .expect() .context() should not be capitalized
 
     let event_loop = winit::event_loop::EventLoop::with_user_event()
         .build()
-        .expect_universal("Event loop building failed");
+        .expect("event loop building failed"); // .expect() is called on both native and on web
+    // there exists wasm_bindgen::UnwrapThrowExt::expect_throw and wasm_bindgen::UnwrapThrowExt::unwrap_throw,
+    // but they are not used at all in this crate because they throw JS error directly, bypassing std::panic::set_hook(),
+    // while in logger.rs, we actually set a panic_hook to allow us to implement some custom behavior on panic, like
+    // logging to web console and sending a CustomEvent to JS
 
     // setting event loop control flow does not seem to make WindowEvents fire faster
     // triggering WindowEvent::RedrawRequested in a loop, redraws occur 60 times per second no matter if it's ControlFlow::Poll or ControlFlow::Wait
@@ -44,7 +39,7 @@ pub fn run() {
     #[cfg(not(target_arch = "wasm32"))]
     event_loop
         .run_app(&mut App::new())
-        .expect_universal("Event loop run app failed");
+        .expect("event loop run_app failed");
     // some guides use run_app() for web as well, however, this is not recommended by winit 0.30+ docs
     // if run_app() was used for web, there would be an intentional JavaScript control flow error in the web console
 
@@ -82,35 +77,36 @@ impl winit::application::ApplicationHandler<State> for App {
     // called by winit when the window is resumed
     // seems to be called only once when the window is opened
     fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
+        // resumed() has method signature that returns nothing, so anyhow cannot be used here
+
         #[allow(unused_mut)]
         // window_attributes doesn't have to be mut on non-wasm, but must be mut on wasm
         let mut window_attributes = winit::window::Window::default_attributes();
 
         #[cfg(target_arch = "wasm32")]
         {
-            // JsCast is a trait implemented by web_sys::Element used for .unchecked_into()
-            use wasm_bindgen::JsCast;
+            use wasm_bindgen::JsCast; // needed for .dyn_into()
             // WindowAttributesExtWebSys is a trait implemented by winit::window::WindowAttributes used for .with_canvas()
             use winit::platform::web::WindowAttributesExtWebSys;
 
             const CANVAS_ID: &str = "rust-insert-wasm"; // matches with index.html <canvas id="rust-insert-wasm">
 
             window_attributes = window_attributes.with_canvas(Some(
-                wgpu::web_sys::window() // becomes Option<web_sys::Window>
-                    .expect_universal("web_sys::Window unwrap failed") // becomes web_sys::Window
-                    .document() // becomes Option<web_sys::Document>
-                    .expect_universal("web_sys::Document unwrap failed") // becomes web_sys::Document
-                    .get_element_by_id(CANVAS_ID) // becomes Option<web_sys::Element>
-                    .expect_universal("web_sys::Element unwrap failed") // becomes web_sys::Element
-                    .unchecked_into(), // becomes what .with_canvas() wants, a web_sys::HtmlCanvasElement
+                web_sys::window()
+                    .expect("get web_sys window failed")
+                    .document()
+                    .expect("get web_sys document failed")
+                    .get_element_by_id(CANVAS_ID)
+                    .expect("canvas element not found in DOM")
+                    .dyn_into::<web_sys::HtmlCanvasElement>()
+                    .expect("canvas element found, but it was not an HtmlCanvasElement"),
             ));
         }
 
-        // create an Arc<Window>
         let window = std::sync::Arc::new(
             event_loop
                 .create_window(window_attributes)
-                .expect_universal("Event loop create_window failed"),
+                .expect("event loop create_window failed"),
         );
         window.set_title("Path Tracer");
 
@@ -118,11 +114,8 @@ impl winit::application::ApplicationHandler<State> for App {
         {
             // use pollster async runtime/executor to await the future from State::new(window)
             self.state = Some(
-                pollster::block_on(State::new(
-                    window,
-                    event_loop.owned_display_handle(), // Supply the newly required display handle
-                ))
-                .expect_universal("State::new failed"),
+                pollster::block_on(State::new(window, event_loop.owned_display_handle()))
+                    .expect("State::new() failed"),
             );
             // for non-wasm, this is where self.state is set, and initialization is finished
         }
@@ -130,27 +123,17 @@ impl winit::application::ApplicationHandler<State> for App {
         #[cfg(target_arch = "wasm32")]
         {
             if let Some(proxy) = self.proxy.take() {
-                // self.proxy is of type Option<EventLoopProxy<State>>
-                // .take() on Option<> makes the original value None, and returns the original value
-                // so after .take(), self.proxy is None, and self.proxy's previous value is matched with Some(proxy)
-                // matched with Some(proxy), proxy is EventLoopProxy<State> in this if let block
-
-                // Fetch display handle here so it's not bound across the async bounds incorrectly
                 let display_handle = event_loop.owned_display_handle();
 
                 wasm_bindgen_futures::spawn_local(async move {
-                    // use the browser's async runtime
-                    // assert panics if what's inside it doesn't evaluate to true
-                    assert!(
-                        proxy
-                            // this essentially is a call to user_event()
-                            .send_event(
-                                State::new(window, display_handle) // Passed display_handle here
-                                    .await
-                                    .expect_universal("State::new failed")
-                            )
-                            .is_ok()
-                    ) // .is_ok() on Result<T, E> returns true if Result<T, E> is Ok(T)
+                    let state = State::new(window, display_handle)
+                        .await
+                        .expect("State::new() failed");
+
+                    proxy
+                        .send_event(state)
+                        .unwrap_or_else(|_| panic!("send_event to EventLoopProxy failed"));
+                    // .expect() isn't used here since the error EventLoopClosed<T> from send_event() doesn't implement Debug (would have to derive Debug for State)
                 });
             }
         }
@@ -176,28 +159,33 @@ impl winit::application::ApplicationHandler<State> for App {
         _window_id: winit::window::WindowId,
         event: winit::event::WindowEvent,
     ) {
-        if let Some(state) = &mut self.state {
-            // self is of type: &mut App
-            // &mut self.state is of type: &mut Option<State>
-            // Some(state) matched with type &mut Option<State> automatically desugars to &mut Some(ref mut state)
-            // self.state of type &mut Option<> is matched with &mut Some()
-            // if this match is successful, what's inside self.state of type &mut Option<>, or just State, is bound to what's inside Some(), or just ref mut state
-            // ref mut makes State, bounded to ref mut state, &mut State instead of just State
-            // so, state in this block is of type: &mut State
-            match event {
-                winit::event::WindowEvent::CloseRequested => event_loop.exit(),
-                winit::event::WindowEvent::Resized(size) => state.resize(size.width, size.height),
-                winit::event::WindowEvent::RedrawRequested => state.update(),
-                winit::event::WindowEvent::KeyboardInput { event, .. } => state.key_event(&event),
-                // mouse button events are just used for locking and hiding cursor
-                winit::event::WindowEvent::MouseInput {
-                    state: mouse_state,
-                    button,
-                    ..
-                } => state.mouse_button_event(mouse_state, button),
-                _ => {}
-            }
-        } // if self.state is not Some() but is None, nothing is done
+        let Some(state) = &mut self.state else {
+            return;
+        };
+
+        // let egui consume events only when the cursor isn't grabbed
+        if !state.is_cursor_grabbed()
+            && state
+                .egui_winit_state
+                .on_window_event(&state.window, &event)
+                .consumed
+        {
+            return;
+        }
+
+        match event {
+            winit::event::WindowEvent::CloseRequested => event_loop.exit(),
+            winit::event::WindowEvent::Resized(size) => state.resize(size.width, size.height),
+            winit::event::WindowEvent::RedrawRequested => state.update(),
+            winit::event::WindowEvent::Focused(false) => state.release_cursor_grab(),
+            winit::event::WindowEvent::KeyboardInput { event, .. } => state.key_event(&event),
+            winit::event::WindowEvent::MouseInput {
+                state: mouse_state,
+                button,
+                ..
+            } => state.mouse_button_event(mouse_state, button),
+            _ => {}
+        }
     }
 
     /// Handle device events such as mouse motion by calling the corresponding method in [`State`].

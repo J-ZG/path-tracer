@@ -1,31 +1,10 @@
 [alias]
-c = """
-clippy --all-targets --all-features -- 
--W clippy::pedantic 
--W clippy::nursery
--W clippy::cargo
--D clippy::unwrap_used
--A clippy::too_many_arguments 
--A clippy::cargo_common_metadata 
--A clippy::multiple_crate_versions
--A clippy::too_many_lines
--A clippy::default_trait_access
--A clippy::trivially_copy_pass_by_ref
--A clippy::items_after_statements
--A clippy::cast_possible_truncation
--A clippy::cast_possible_wrap
--A clippy::cast_precision_loss
--A clippy::cast_sign_loss
--A clippy::must_use_candidate
--A clippy::missing_errors_doc
--A clippy::missing_panics_doc
--A clippy::many_single_char_names
-"""
+c = "clippy --all-targets --all-features"
+cw = "clippy --target wasm32-unknown-unknown --all-targets" # no --all-features because testing feature is not supported on the web
 rr = "run --release"
 t = "run --features testing"
 
 [build]
 rustflags = ["--cfg=web_sys_unstable_apis"]
-
-[env]
-RUST_LOG = "info"
+# can add ["-W", "unused-crate-dependencies"], but will generate false positives: 
+# https://github.com/rust-lang/rust/issues/95513

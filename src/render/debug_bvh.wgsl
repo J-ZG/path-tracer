@@ -2,6 +2,8 @@
 // leaf nodes are colored red, and internal nodes are colored blue
 // see the main path tracing compute shader trace_paths.wgsl for explanation on the bindings, how the BVH is traversed, how ray-AABB intersection is performed, etc.
 
+// TODO: update this, or just put it in trace_paths, also allowing user to switch between path tracing and BVH rendering during runtime
+
 struct GpuTriangleGeometry {
     coords: array<f32, 9>,
 };
