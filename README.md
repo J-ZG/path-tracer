@@ -78,7 +78,7 @@ path-tracer/
 * `cargo t`: Run with `testing` feature enabled, allowing more debug information to be outputted during running (which may significantly worsen performance). **Broken on macOS due to issue with Tracy, see [Wumpf/wgpu-profiler](https://github.com/Wumpf/wgpu-profiler/issues/107).** `testing` feature is only supported on native, since debug output files are saved to disk, in `debug_output/` (which is gitignored). If there are errors during build related to C++, it's often because build tools are missing; one option is to install them through [Build Tools for Visual Studio](https://visualstudio.microsoft.com/downloads/#build-tools-for-visual-studio-2026). Profiling with Tracy is supported:
     1. Download [Tracy](https://github.com/wolfpld/tracy/releases/).
     1. Have the Tracy profiler open while path-tracer is running. path-tracer-app should appear under the discovered clients.
-* `cargo bench --bench desired_bench -- desired_function`: Run a benchmark. `desired_bench` is a filename in [`benches/`](https://github.com/0dpe/path-tracer/tree/main/benches), and `desired_function` is the ID of a `bench_function`. Criterion is used; view the detailed benchmark reports at `target/criterion/report/index.html`.
+* `cargo bench --bench filename -- function`: Run a benchmark. `filename` is a filename in [`benches/`](https://github.com/0dpe/path-tracer/tree/main/benches), and `function` is the ID of a `bench_function`. Criterion is used; view the detailed benchmark reports at `target/criterion/report/index.html`.
 * `cargo doc --open --document-private-items --no-deps --target wasm32-unknown-unknown`: Generate and view the documentation.
 
 To see a translated WGSL shader, use `naga-cli`:

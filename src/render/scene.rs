@@ -15,10 +15,12 @@ pub const ATLAS_SIZE: u32 = 8192;
 
 // TODO: fix transparency in textures; parsing is done correctly, but shader is not correct. also, in gltf::material, parse alpha_mode and alpha_cutoff to do this properly
 // TODO: add vertex colors
-// TODO: update wgpu to 30 once egui supports it
-// TODO: allow user to use their own glb files
+// TODO IP: wasm32 build failing due to bug in egui-winit, also version 30 greatly worsened performance and has lag spikes
+// TODO 2: allow user to use their own glb files
+// TODO: render at a smaller resolution by default (maybe by somehow running an auto benchmark before anything runs to determine the user's hardware capabilities), and allow user to adjust resolution, so the app doesn't crash the user's computer
 
 /// Contains all the data loaded from a glTF file and formatted for the GPU.
+/// 
 /// The coordinate system is: +X to the right of the screen, +Y up the screen, and -Z into the screen.
 pub struct Scene {
     // geometries[i] and attributes[i] together represent a triangle at index i
@@ -168,14 +170,14 @@ pub struct GpuMaterial {
     pub roughness_factor: f32,
     /// Defaults to `0.0`; in [0, 1].
     pub OpenPBR_emission_weight: f32,
-    /// Emissive color in linear RGB and emissive strength in the 4th value. RGB is a linear multiplier to the emissive texture; if no texture, the emissive color is just this color.
+    /// Emission color in linear RGB and emission strength in the 4th value. RGB is a linear multiplier to the emission texture; if no texture, the emission color is just this color.
     ///
     /// RGB parsed from [material.emissiveFactor](https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html#_material_emissivefactor) and strength from [KHR_materials_emissive_strength](https://github.com/KhronosGroup/glTF/tree/main/extensions/2.0/Khronos/KHR_materials_emissive_strength).
     ///
     /// Defaults to `(0.0, 0.0, 0.0, 1.0)`; RGB in [0, 1].
     ///
     /// Intended OpenPBR counterpart identifiers: `emission_color` and `emission_luminance`. OpenPBR's defaults are `(1.0, 1.0, 1.0)` and `1000`; RGB in [0, ∞) and luminance in [0, ∞). Luminance has units of nits.
-    pub emissive_color_and_strength: glam::Vec4,
+    pub emission_color_and_strength: glam::Vec4,
     /// Specular color in linear RGB and weight of specular in the 4th value. RGB is a linear multiplier to the specular color texture; if no texture, the specular color is just this color.
     ///
     /// Parsed from [KHR_materials_specular](https://github.com/KhronosGroup/glTF/tree/main/extensions/2.0/Khronos/KHR_materials_specular).
@@ -219,8 +221,8 @@ pub struct GpuMaterial {
     normal_tex_layer: i32,
     /// Index into [`Scene::linear_texture_atlases`] for the texture atlas containing the linear metallic-roughness texture; `-1` if no texture.
     metallic_roughness_tex_layer: i32,
-    /// Index into [`Scene::srgb_texture_atlases`] for the texture atlas containing the sRGB emissive texture; `-1` if no texture.
-    emissive_tex_layer: i32,
+    /// Index into [`Scene::srgb_texture_atlases`] for the texture atlas containing the sRGB emission texture; `-1` if no texture.
+    emission_tex_layer: i32,
     /// Index into [`Scene::srgb_texture_atlases`] for the texture atlas containing the sRGB specular color texture; `-1` if no texture.
     specular_color_tex_layer: i32,
     /// Index into [`Scene::linear_texture_atlases`] for the texture atlas containing the linear specular factor texture; `-1` if no texture.
@@ -232,8 +234,8 @@ pub struct GpuMaterial {
     normal_uv: glam::Vec4,
     /// Offset (x, y) and scale (x, y) for the metallic-roughness texture in an atlas; if no texture, are all zeros.
     metallic_roughness_uv: glam::Vec4,
-    /// Offset (x, y) and scale (x, y) for the emissive texture in an atlas; if no texture, are all zeros.
-    emissive_uv: glam::Vec4,
+    /// Offset (x, y) and scale (x, y) for the emission texture in an atlas; if no texture, are all zeros.
+    emission_uv: glam::Vec4,
     /// Offset (x, y) and scale (x, y) for the specular color texture in an atlas; if no texture, are all zeros.
     specular_color_uv: glam::Vec4,
     /// Offset (x, y) and scale (x, y) for the specular factor texture in an atlas; if no texture, are all zeros.
@@ -951,7 +953,7 @@ impl Scene {
         let (normal_tex_layer, normal_uv) =
             get_linear_layer_and_uv(norm_tex.as_ref().map(|t| t.texture().source().index()));
 
-        let (emissive_tex_layer, emissive_uv) =
+        let (emission_tex_layer, emission_uv) =
             get_srgb_layer_and_uv(mat.emissive_texture().map(|t| t.texture().source().index()));
 
         let specular = mat.specular();
@@ -1039,7 +1041,7 @@ impl Scene {
             metallic_factor: pbr.metallic_factor(),
             roughness_factor: pbr.roughness_factor(),
             OpenPBR_emission_weight,
-            emissive_color_and_strength: glam::Vec4::from((
+            emission_color_and_strength: glam::Vec4::from((
                 glam::Vec3::from(mat.emissive_factor()),
                 mat.emissive_strength().unwrap_or(1.0),
             )),
@@ -1063,14 +1065,14 @@ impl Scene {
             base_color_tex_layer,
             normal_tex_layer,
             metallic_roughness_tex_layer,
-            emissive_tex_layer,
+            emission_tex_layer,
             specular_factor_tex_layer,
             specular_color_tex_layer,
 
             base_color_uv,
             normal_uv,
             metallic_roughness_uv,
-            emissive_uv,
+            emission_uv,
             specular_factor_uv,
             specular_color_uv,
         }

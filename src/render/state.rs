@@ -2,12 +2,13 @@
 //!
 //! Includes methods for initializing these resources and handling events from the window.
 
-/// The name of the glTF file to load from the [`assets/`](https://github.com/0dpe/path-tracer/tree/main/assets) directory to render.
+/// The name of the glTF file to load from the [`assets/glb/`](https://github.com/0dpe/path-tracer/tree/main/assets/glb) directory to render.
 ///
 /// Can be exported from Blender.
 /// ![Export glTF from Blender 1](https://raw.githubusercontent.com/0dpe/path-tracer/main/doc/blender_export_gltf_1.jpg)
 /// ![Export glTF from Blender 2](https://raw.githubusercontent.com/0dpe/path-tracer/main/doc/blender_export_gltf_2.jpg)
-const GLTF: &str = "box";
+/// Be sure to check `Include > Custom Properties` and `Mesh > Apply Modifiers`.
+const GLTF: &str = "my cornell v2";
 
 use anyhow::Context;
 
@@ -29,16 +30,16 @@ pub struct State {
     compute_0_bind_group: wgpu::BindGroup,
     /// Bind group 0 for the render shader, containing just the storage texture read from by the fragment shader.
     render_0_bind_group: wgpu::BindGroup,
-    /// Bind group layout for [`Self::compute_0_bind_group`], needed here to recreate the bind group on window resizes.
+    /// Bind group layout for [`State::compute_0_bind_group`], needed here to recreate the bind group on window resizes.
     compute_0_bind_group_layout: wgpu::BindGroupLayout,
-    /// Bind group layout for [`Self::render_0_bind_group`], needed here to recreate the bind group on window resizes.
+    /// Bind group layout for [`State::render_0_bind_group`], needed here to recreate the bind group on window resizes.
     render_0_bind_group_layout: wgpu::BindGroupLayout,
 
     /// Bind group 1 for the compute shader, containing mostly scene data. This bind group is separated from group 0 because this group never needs to be recreated during runtime (hence, its layout also isn't stored in this struct).
     compute_1_bind_group: wgpu::BindGroup,
     /// Buffer for camera data. Written to when the camera moves.
     camera_buffer: wgpu::Buffer,
-    /// Buffer for frame count value used by the shader for accumulation and RNG seeding. Written to every frame.
+    /// Buffer for frame count value used by the shader for accumulation and RNG seeding. Written to every frame with [`State::frame_count`].
     frame_count_buffer: wgpu::Buffer,
     /// Buffer for material data. Written to when the user modifies a material through the UI.
     materials_buffer: wgpu::Buffer,
@@ -62,7 +63,7 @@ pub struct State {
     /// Tracks the number of frames rendered since the last camera movement or window resize.
     ///
     /// Used for accumulation in the compute shader, where the shader can use this count to determine how many frames have been accumulated so far and adjust its calculations accordingly.
-    /// Note that when the shader gets this value (via [`wgpu::Queue::write_buffer()`]), it's always at least 1.
+    /// Note that when the shader gets this value (via [`wgpu::Queue::write_buffer()`]), it's always at least `1`.
     frame_count: u32,
 
     /// The index of the material the camera is currently pointed at. Used for determining which material the UI targets.
@@ -136,6 +137,8 @@ impl State {
                 power_preference: wgpu::PowerPreference::HighPerformance,
                 compatible_surface: Some(&surface),
                 force_fallback_adapter: false,
+                // TODO: 30
+                // apply_limit_buckets: false,
             })
             .await?;
         log::info!("Using adapter: {}", adapter.get_info().name); // doesn't log the name on web for some reason, but logs fine on native
@@ -209,6 +212,8 @@ impl State {
             desired_maximum_frame_latency: 2,
             alpha_mode: wgpu::CompositeAlphaMode::Auto,
             view_formats: vec![wgpu::TextureFormat::Bgra8Unorm],
+            // TODO: 30
+            // color_space: wgpu::SurfaceColorSpace::Auto, 
         };
 
         // update() only works when the surface is configured
@@ -358,6 +363,12 @@ impl State {
                         },
                         count: None,
                     },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 10, // skybox sampler
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
                 ],
             });
 
@@ -434,12 +445,6 @@ impl State {
         scene
             .camera
             .translate_and_rotate_to(Some(glam::Vec3::new(0.0, 0.0, 7.0)), None, None);
-
-        // scene.camera.translate_and_rotate_to(
-        //     Some(glam::Vec3::new(-7.04, -0.10, 1.4)),
-        //     Some(-0.86),
-        //     Some(-0.46),
-        // );
 
         // for dragon.glb:
         // scene.camera.translate_and_rotate_to(Some(glam::Vec3::new(-4.0, 0.2, 0.0)), Some(-90.0_f32.to_radians()), None);
@@ -627,7 +632,7 @@ impl State {
                     binding: 6,
                     resource: wgpu::BindingResource::Sampler(&device.create_sampler(
                         &wgpu::SamplerDescriptor {
-                            label: Some("Sampler"),
+                            label: Some("Atlas sampler"),
                             address_mode_u: wgpu::AddressMode::ClampToEdge,
                             address_mode_v: wgpu::AddressMode::ClampToEdge,
                             address_mode_w: wgpu::AddressMode::ClampToEdge,
@@ -645,6 +650,21 @@ impl State {
                 wgpu::BindGroupEntry {
                     binding: 8,
                     resource: frame_count_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 10,
+                    resource: wgpu::BindingResource::Sampler(&device.create_sampler(
+                        &wgpu::SamplerDescriptor {
+                            label: Some("Skybox sampler"),
+                            address_mode_u: wgpu::AddressMode::ClampToEdge,
+                            address_mode_v: wgpu::AddressMode::ClampToEdge,
+                            address_mode_w: wgpu::AddressMode::ClampToEdge,
+                            mag_filter: wgpu::FilterMode::Linear,
+                            min_filter: wgpu::FilterMode::Linear,
+                            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+                            ..Default::default()
+                        },
+                    )),
                 },
             ],
         });
@@ -807,7 +827,7 @@ impl State {
 
                 let mut ui_changed_mat_index = None;
 
-                let full_output = self.egui_context.run_ui(
+                let mut full_output = self.egui_context.run_ui(
                     self.egui_winit_state.take_egui_input(&self.window),
                     |root_ui| {
                         if self.show_ui {
@@ -885,6 +905,17 @@ impl State {
                         image_delta,
                     );
                 }
+                // TODO: 30
+                // for (id, image_deltas) in &full_output.textures_delta.set {
+                //     for image_delta in image_deltas {
+                //         self.egui_wgpu_renderer.update_texture(
+                //             &self.device,
+                //             &self.queue,
+                //             *id,
+                //             image_delta,
+                //         );
+                //     }
+                // }
 
                 // used for both egui_wgpu_renderer.update_buffers() and egui_wgpu_renderer.render()
                 let screen_descriptor = egui_wgpu::ScreenDescriptor {
@@ -1013,6 +1044,7 @@ impl State {
                 for id in &full_output.textures_delta.free {
                     self.egui_wgpu_renderer.free_texture(id);
                 }
+                full_output.textures_delta.clear();
 
                 drop(render_pass); // will cause runtime panic if this wasn't called before profiler.end_query(&mut encoder, outer_query)
 
@@ -1030,6 +1062,8 @@ impl State {
                 self.window.pre_present_notify();
 
                 frame.present();
+                // TODO: 30 
+                // self.queue.present(frame);
 
                 // the first proper frame is presented, so there is something on the canvas on the web,
                 // so the loading screen in index.html can fade out

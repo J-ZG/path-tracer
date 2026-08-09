@@ -14,22 +14,26 @@ const LUMA_COEFFICIENTS = vec3f(0.2126, 0.7152, 0.0722); // standard Rec. 709 co
 // don't change, for example, sky_color (it's physically accurate for a clear sky to be 8000 nits)
 // in other words: don't cheat the lighting; only change the camera
 
-// Sunny 16: aperture = 16.0, shutter_speed = 0.008 (1/125th of a second), iso = 100.0
+// Sunny 16: aperture 16, shutter_speed 0.008 (1/125th of a second), iso 100
 // then, eq.67 from https://seblagarde.wordpress.com/wp-content/uploads/2015/07/course_notes_moving_frostbite_to_pbr_v32.pdf:
-// EV100 = log2((aperture^2 * 100.0) / (shutter_speed * iso)) ≈ 14.9657842847
+// EV100 = log2((aperture^2 * 100) / (shutter_speed * iso)) ≈ 14.9657842847
 // max_luminance = 1.2 * 2^(EV100) = 38400
-// EXPOSURE = 1 / max_luminance ≈ 0.00002604166 
-// note that Sunny 16 may be way too low for many scenes (my cornell box scene needs a light of 400,000 nits to look proper)
-// EXPOSURE of 0.001 can come from approximately aperture 4, shutter speed 1/50, iso 100
+// EXPOSURE = 1 / max_luminance ≈ 0.00002604166
+// also, EXPOSURE = 0.001 can come from approximately aperture 4, shutter speed 1/50, iso 100; typical for indoor scenes
 const EXPOSURE = 0.00002604166;
-// TODO: allow the user to adjust aperture and shutter speed during runtime, and implement optionally enabling auto exposure
-// TODO: implement more actual camera stuff like depth of field
+// TODO: implement and allow the user to adjust (can be stored in GpuCamera struct):
+// - aperture: enables depth of field
+// - shutter speed: needed for calculating EXPOSURE assuming ISO is 100, also implement auto exposure
+// - focus distance: also implement auto focus
+// - sensor width: must be different from window size
+// - focal length: together with sensor width determines FOV (get rid of just the FOV slider)
+// - optionally aperture blades: defines the look of bokeh
 
-// TODO: implement tracing shadow rays for better denoising (NEE), then combine everything with MIS; eventually, look into ReSTIR or something
+// TODO 4: implement tracing shadow rays for better denoising (NEE), then combine everything with MIS; eventually, look into ReSTIR or something
 // TODO: look into possibly making a branched path tracer
 // TODO: look into spectral rendering
 
-// TODO: normals are still not perfect; edges of round objects with specular roughness close to zero are black
+// TODO: mirror materials with normals have mirror reflections that aren't smooth; can see triangle edges
 
 // to go from the debug YAML to Blender: negate Z, then swap Z and Y
 
@@ -48,7 +52,7 @@ struct GpuTriangleGeometry {
     // benchmarks show that using a flat array vs vec3 doesn't cause a performance difference
 };
 struct GpuTriangleAttribute {
-    index: u32, // index into the GpuMaterial
+    index: u32, // index into materials for the GpuMaterial this triangle uses
     normals: array<f32, 9>, // same packing logic as GpuTriangleGeometry for the normals of the 3 vertices
     uv0: vec2f,
     uv1: vec2f,
@@ -62,7 +66,7 @@ struct BvhNode {
     aabb_min: vec3f,
     left_first: u32,
     aabb_max: vec3f,
-    prim_count: u32,
+    tri_count: u32,
 }
 
 // field names here follow OpenPBR
@@ -72,7 +76,7 @@ struct GpuMaterial {
     base_metalness: f32,
     base_diffuse_roughness: f32,
     emission_weight: f32,
-    emissive_color_and_luminance: vec4f, // glTF restricts RGB to [0, 1] while OpenPBR allows [0, ∞)
+    emission_color_and_luminance: vec4f, // glTF restricts RGB to [0, 1] while OpenPBR allows [0, ∞)
     specular_color_and_weight: vec4f, // OpenPBR specifies specular color in [0, 1], but the RGB values stored here may exceed 1
     specular_roughness: f32,
     specular_roughness_anisotropy: f32,
@@ -85,13 +89,13 @@ struct GpuMaterial {
     base_color_tex_layer: i32,
     normal_tex_layer: i32,
     metallic_roughness_tex_layer: i32,
-    emissive_tex_layer: i32,
+    emission_tex_layer: i32,
     specular_color_tex_layer: i32,
     specular_weight_tex_layer: i32,
     base_color_uv: vec4f,
     normal_uv: vec4f,
     metallic_roughness_uv: vec4f,
-    emissive_uv: vec4f,
+    emission_uv: vec4f,
     specular_color_uv: vec4f,
     specular_weight_uv: vec4f,
 };
@@ -114,6 +118,8 @@ struct GpuCamera {
 @group(1) @binding(6) var atlas_sampler: sampler;
 @group(1) @binding(7) var<uniform> camera: GpuCamera;
 @group(1) @binding(8) var<uniform> frame_count: u32;
+@group(1) @binding(9) var skybox_texture: texture_cube<f32>; // TODO finish implementing skybox
+@group(1) @binding(10) var skybox_sampler: sampler;
 
 struct Ray {
     origin: vec3f, // camera origin position in world space
@@ -128,7 +134,7 @@ fn fifth_power(x: f32) -> f32 {
 // PCG random number generator
 // https://www.pcg-random.org/index.html
 // TODO: low-discrepancy sequences and blue noise are better
-var<private> rng_state: u32 = 0;
+var<private> rng_state = 0u;
 fn seed_rand(invocation_id: vec3u, frame_count: u32) {
     rng_state = (invocation_id.x * 0x9E3779B9u)
       ^ (invocation_id.y * 0x85EBCA6Bu)
@@ -319,7 +325,7 @@ fn compute_main(@builtin(global_invocation_id) global_id: vec3u) {
         let Sx = -ray.direction[kx] * Sz;
         let Sy = -ray.direction[ky] * Sz;
 
-        // setup fixed-size stack for BVH traversal (depth 64 is sufficient for millions of primitives)
+        // setup fixed-size stack for BVH traversal (depth 64 is sufficient for millions of triangles)
         var stack: array<u32, 64>;
         var stack_ptr = 0u;
 
@@ -349,8 +355,8 @@ fn compute_main(@builtin(global_invocation_id) global_id: vec3u) {
                 continue;
             }
 
-            if node.prim_count > 0u { // leaf node; intersect with primitives
-                for (var i = 0u; i < node.prim_count; i += 1u) {
+            if node.tri_count > 0u { // leaf node; intersect with triangles
+                for (var i = 0u; i < node.tri_count; i += 1u) {
                     let tri_index = node.left_first + i;
                     let tri = triangles_geo[tri_index];
 
@@ -410,7 +416,7 @@ fn compute_main(@builtin(global_invocation_id) global_id: vec3u) {
 
         // ray escaped the scene, render sky color and terminate
         if hit_index == -1 {
-            // TODO: allow user to input skybox with nits
+            // TODO 3: allow user to input skybox with nits
 
             // normal clear sky at 8000 nits (should be paired with EXPOSURE from Sunny 16), calculated like so:
             // raw_sky_color = vec3f(0.4, 0.6, 1.0), and target_nits = 8000
@@ -505,24 +511,24 @@ fn compute_main(@builtin(global_invocation_id) global_id: vec3u) {
             specular_weight *= specular_factor_tex.a;
         }
 
-        var emissive_color = mat.emissive_color_and_luminance.rgb;
-        if mat.emissive_tex_layer >= 0 {
-            let emissive_tex = textureSampleLevel(
+        var emission_color = mat.emission_color_and_luminance.rgb;
+        if mat.emission_tex_layer >= 0 {
+            let emission_tex = textureSampleLevel(
                 srgb_texture_atlas,
                 atlas_sampler,
-                fma(interpolated_uv, mat.emissive_uv.zw, mat.emissive_uv.xy),
-                mat.emissive_tex_layer,
+                fma(interpolated_uv, mat.emission_uv.zw, mat.emission_uv.xy),
+                mat.emission_tex_layer,
                 0.0
             );
-            emissive_color *= emissive_tex.rgb; // alpha channel ignored per glTF spec; OpenPBR also doesn't specify alpha channel for emissive color
+            emission_color *= emission_tex.rgb; // alpha channel ignored per glTF spec; OpenPBR also doesn't specify alpha channel for emission color
         }
 
         // emission_color is only a hue while emission_luminance is the actual luminance in nits; 
         // normalize emission_color so its luminance is 1.0 before using it for final_color
         // this makes tweaking the emission_color artistically slightly unintuitive, but ensures that emission_luminance is the actual final luminance of the material
-        let emissive_luma = dot(emissive_color, LUMA_COEFFICIENTS);
-        if emissive_luma > 0.0 {
-            final_color += throughput * mat.emission_weight * mat.emissive_color_and_luminance.a * emissive_color / emissive_luma;
+        let emission_luma = dot(emission_color, LUMA_COEFFICIENTS);
+        if emission_luma > 0.0 {
+            final_color += throughput * mat.emission_weight * mat.emission_color_and_luminance.a * emission_color / emission_luma;
         }
 
         let V = -ray.direction; // view vector, going from the surface to the camera expressed in world space
@@ -541,7 +547,7 @@ fn compute_main(@builtin(global_invocation_id) global_id: vec3u) {
         let flat_N = flat_N_raw * back_face_multiplier;
 
         // get T tangent (x), B bitangent (y), and N normal (z), all orthogonal to each other, 
-        // which form a coordinate basis used to reorientate vectors from local normal space -> world space or vice versa
+        // which form a coordinate basis used to reorient vectors from local normal space -> world space or vice versa
 
         let n0 = vec3f(attr.normals[0], attr.normals[1], attr.normals[2]);
         let n1 = vec3f(attr.normals[3], attr.normals[4], attr.normals[5]);
@@ -582,21 +588,48 @@ fn compute_main(@builtin(global_invocation_id) global_id: vec3u) {
             N_changed = true;
         }
 
+        // dot(N, V) being < 0 means that the light ray (wo) actually came from below the surface, which is impossible, since the ray should have been occluded by other geometry earlier on
+        // the physically accurate solution would be to just break (terminate the ray) here, but that would create ugly black
+        // after all, normals are inherently an unphysical illusion; so instead, reorient N so that shading makes sense, at the cost of disobeying the artist a little bit
+        // also note that just handling dot(N, V) < 0 by reorienting N just enough so that dot(N, V) >= 0 is not a robust solution because: 
+        // even when dot(N, V) >= 0, the new light ray (wi) can still have a high chance of going under the surface (particularly probable when the material is a perfect mirror)
+        // when the new light ray goes under the surface, the light ray is terminated, which, among other problems, causes ugly black
+        // so here, reorient N by more than enough to make not only dot(N, V) >= 0, but also to make potentially less new light rays go under the surface
+        // specifically, reorient N so that dot(N, V) = 0.5 * dot(flat_N, V)
+        // 0.5 * dot(flat_N, V) comes from this derivation:
+        // suppose the material is a perfect mirror; then, the new light ray is R = reflect(-V, N) = 2 * dot(N, V) * N - V
+        // the goal is to reorient N just enough so that dot(R, flat_N) >= 0; this also guarantees that dot(N, V) >= 0
+        // then, dot(2 * dot(N, V) * N - V, flat_N) >= 0
+        // distribute to get 2 * dot(N, V) * dot(N, flat_N) - dot(V, flat_N) >= 0
+        // here, an assumption is made, dot(N, flat_N) ≈ 1, which underestimates the amount N should be reoriented
+        // then, 2 * dot(N, V) - dot(flat_N, V) >= 0
+        // so dot(N, V) >= 0.5 * dot(flat_N, V)
+
+        // note that N, V, and flat_N should all be unit vectors
+        let flat_NdotV = dot(flat_N, V); // this is definitely a positive value 
+        let threshold = 0.5 * flat_NdotV;
         var NdotV = dot(N, V);
-        if NdotV < 0x1.0p-23f { // < 0.0 here causes problems, but this seems fine
-            // N and V form an obtuse angle, meaning that the hit was actually never possible; this ray should have been occluded by another part of the surface
-            // the physically accurate solution is to just break here, but that would create black triangles around anything with normals; after all, normals are inherently an unphysical illusion
-            // so instead, reorientate N toward flat_N as we know that flat_N definitely forms an acute angle with V (we flipped N if the ray-triangle intersection was back-facing; see back_face_multiplier)
-            // reorientate just enough so that N and V are just about orthogonal
-            // dot(mix(N, flat_N, t), V) == ε, and we solve for t
+        if NdotV < threshold {
+            // reorient N just enough so that dot(N, V) = threshold:
+            // dot(mix(N, flat_N, t), V) = threshold, and we solve for t
             // note that mix(N, flat_N, t) is equivalent to N + t * (flat_N - N)
-            // hence t = (ε - NdotV) / (flat_NdotV - NdotV)
-            // note that flat_NdotV > NdotV should be true, since again, flat_N forms an acute angle with V, and NdotV < ε
-            let t = saturate((0x1.0p-23f - NdotV) / dot(flat_N - N, V));
-            N = normalize(mix(N, flat_N, t));
-            NdotV = 0x1.0p-23f;
+            // hence t = (threshold - NdotV) / (flat_NdotV - NdotV)
+            // note that (flat_NdotV > NdotV) should be true, since (0.5 * flat_NdotV > NdotV) was the condition; division by zero is impossible here (and no saturate() is needed either)
+            N = normalize(mix(N, flat_N, (threshold - NdotV) / (flat_NdotV - NdotV))); // note that this doesn't actually guarantee that dot(N, V) = threshold, since mix() does not produce a unit vector, and the normalize() changes things
+            NdotV = dot(N, V); // note that technically this could be 0.0, which would result in division by zero later on, but I don't observe any problems during runtime as it is now
             N_changed = true;
         }
+
+        // if we don't assume dot(N, flat_N) ≈ 1:
+        // let R = reflect(-V, N);
+        // let flat_NdotR = dot(R, flat_N);
+        // if flat_NdotR < 0.0 { // dot(N, V) < 0 is implicitly handled too, since dot(N, V) < 0 when flat_NdotR < 0 thanks to how the math in reflect() works
+        //     N = normalize(R - flat_NdotR * flat_N + V); // R - flat_NdotR * flat_N is the new R
+        //     N_changed = true;
+        // }
+        // then just let NdotV = dot(N, V);
+        // this approach is not adopted because somehow it produces less visually intuitive results compared to when dot(N, flat_N) ≈ 1 is assumed
+        // better approaches might be brute-force geometry or "Microfacet-based Normal Mapping for Robust Monte Carlo Path Tracing" https://jo.dreggn.org/home/2017_normalmap.pdf
 
         if N_changed {
             // re-orthogonalize since N changed
@@ -616,7 +649,7 @@ fn compute_main(@builtin(global_invocation_id) global_id: vec3u) {
         // specular_color
         // specular_weight
 
-        // TODO: specular haze and retroreflectivity are not implemented yet
+        // TODO 6: specular haze and retroreflectivity are not implemented yet
 
         // convert user-given parameters to alpha values (anisotropic)
         // OpenPBR eq.21
@@ -654,8 +687,7 @@ fn compute_main(@builtin(global_invocation_id) global_id: vec3u) {
         // the new ray direction
         var wi: vec3f;
 
-        // TODO: OpenPBR 3.6.3 Multiple Scattering: Torrance-Sparrow as it is used below (single-scattering) doesn't conserve energy, as it neglects to account for multiple scattering between the microfacets
-
+        // TODO 5: OpenPBR 3.6.3 Multiple Scattering: Torrance-Sparrow as it is used below (single-scattering) doesn't conserve energy, as it neglects to account for multiple scattering between the microfacets
         // TODO: white furnace test fails slightly, unrelated to multiple scattering, related to EON
 
         // metal (f_conductor), gloss (f_dielectric), and diffuse (f_diffuse) all are described by microfacet model
@@ -665,17 +697,30 @@ fn compute_main(@builtin(global_invocation_id) global_id: vec3u) {
         // diffuse, though, has microfacets of Lambertian surface, not mirror-like
         // so, diffuse doesn't use Torrance-Sparrow, but instead uses energy-preserving Oren-Nayar (EON)
 
-        // for metal and gloss, for the D term (normal distribution function) in Torrance-Sparrow, we use GGX (Trowbridge-Reitz)
-        // to sample this GGX normal distribution function, we use VNDF (visible normal distribution function) sampling
-
-        // for diffuse, EON has its own equations, including its own sampling strategy (a mix between uniform and CLTC sampling)
-
         // note that OpenPBR states, "For dielectrics there is also a BTDF..."
         // but that is not implemented here since layering is done with albedo-scaling approximation (with E_dielectric below)
         // it's also not implemented because the spec states that gloss has "infinitesimal layer thickness," 
         // and that diffuse is "an (index-matched) opaque slab with a diffuse BRDF" (not a BSDF)
 
-        // estimate E_dielectric with on-the-fly Monte Carlo (since we don't have precomputed LUTs)
+        // Monte Carlo is basically: we can estimate the area of a shape by encompassing it in another shape (where we know this outer shape's area already),
+        // and we throw darts randomly and count what percentage of all darts landed in the inner area; 
+        // if we throw an infinite amount of darts, then this percentage, multiplied with the outer shape's area, should yield the inner shape's area
+
+        // importance sampling with Monte Carlo would be to just throw darts more frequently in some direction we choose rather than completely randomly,
+        // and then compensating by weighing each dart (their contribution to the percentage) according to how often darts were thrown in that direction, 
+        // so that with infinite amount of darts, the estimated value should still equal the exact value
+
+        // below, we do importance sampling for determining a singular wi
+        // we choose only a singular wi because otherwise, the amount of rays to evaluate would explode exponentially
+        // we use importance sampling because there are multiple sampling strategies for determining a wi, and we reduce variance by assigning each strategy a different probability of being chosen:
+        // for metal and gloss, for the D term (normal distribution function) in Torrance-Sparrow, we use GGX (Trowbridge-Reitz); to sample this GGX normal distribution function, we use the VNDF (visible normal distribution function) sampling strategy
+        // for diffuse, EON has its own equations, including its own sampling strategy (a mix between uniform and CLTC sampling)
+        // hence, we calculate probabilities for selecting either VNDF or EON sampling
+
+        // E_dielectric is, for gloss, with a given light direction (wo), the percentage of light that reflects in all directions
+        // 0% means the gloss surface absorbs all light, and 100% means it reflects all light (in whatever directions)
+        // estimated on the fly (since we don't have precomputed LUTs)
+        // E_dielectric is used to calculate better probabilities below and also to calculate f_glossy_diffuse with albedo-scaling approximation later
         let one_plus_lambda_wo = 1.0 + ggx_lambda(wo, alpha);
         var sum_W = 0.0;
         let num_samples = 16u;
@@ -689,25 +734,21 @@ fn compute_main(@builtin(global_invocation_id) global_id: vec3u) {
             sum_W += F * one_plus_lambda_wo / (one_plus_lambda_wo + ggx_lambda(wi, alpha)); // F * G2 / G1
         }
         let E_dielectric = specular_color * sum_W / f32(num_samples);
-        // E_dielectric is used to calculate better probabilities below and also to calculate f_glossy_diffuse with albedo-scaling approximation later
 
-        // to determine a singular wi, calculate probabilities for selecting either VNDF or EON sampling
-        // any procedure here (as long as it doesn't assign probability of 0 to anything) won't introduce bias, just variance
+        // calculate probabilities for selecting either VNDF or EON sampling
 
         let albedo_gloss = dot(E_dielectric, LUMA_COEFFICIENTS);
         let albedo_diffuse = (1.0 - albedo_gloss) * mat.base_weight * dot(base_color, LUMA_COEFFICIENTS);
         let fresnel_schlick_metal = F0_conductor + (1.0 - F0_conductor) * fifth_power(1.0 - NdotV);
         let albedo_metal = dot(fresnel_schlick_metal, LUMA_COEFFICIENTS);
 
-        // weights for probabilities
         let w_ggx = mix(albedo_gloss, albedo_metal, base_metalness);
         let w_diffuse = (1.0 - base_metalness) * albedo_diffuse;
 
-        // probabilities
         let p_ggx = clamp(w_ggx / max(w_ggx + w_diffuse, 1e-7), 0.1, 0.9); // TODO: this 1e-7 small number hasn't been tested
         let p_diffuse = 1.0 - p_ggx;
 
-        // a var is declared here because if EON is chosen, the EON pdf is calculated along with wi together at the same time 
+        // a var is declared here because if EON is chosen, the EON pdf is calculated along with wi together at the same time
         // this is because calculating pdf does not require many extra math steps when calculating wi simultaneously
         // if GGX is chosen instead, pdf_eon stays unmodified as -1.0
         // so later on, we check if pdf_eon == -1.0 and calculate EON pdf if true, else just use existing value

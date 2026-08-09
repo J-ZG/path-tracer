@@ -37,9 +37,9 @@ fn fs_main(@builtin(position) frag_position: vec4f) -> @location(0) vec4f {
     // linear -> sRGB gamma conversion
     let srgb_color = select(
         mapped * 12.92,
-        pow(mapped, vec3<f32>(1.0 / 2.4)) * 1.055 - 0.055,
-        mapped > vec3<f32>(0.0031308)
+        pow(mapped, vec3f(1.0 / 2.4)) * 1.055 - 0.055,
+        mapped > vec3f(0.0031308)
     );
 
-    return vec4<f32>(srgb_color, color.a);
+    return vec4f(srgb_color, color.a);
 }

@@ -472,15 +472,15 @@ pub fn run(
                 );
                 mat_changed |= mat_slider(
                     ui,
-                    &mut mat.emissive_color_and_strength.w,
-                    initial_mat.emissive_color_and_strength.w,
+                    &mut mat.emission_color_and_strength.w,
+                    initial_mat.emission_color_and_strength.w,
                     0.0..=1_500_000.0,
                     "Emission Luminance (nits)",
                 );
                 mat_changed |= color_rgb(
                     ui,
-                    &mut mat.emissive_color_and_strength,
-                    initial_mat.emissive_color_and_strength,
+                    &mut mat.emission_color_and_strength,
+                    initial_mat.emission_color_and_strength,
                     "Emission Color",
                 );
                 mat_changed |= mat_slider(
