@@ -8,7 +8,7 @@
 /// ![Export glTF from Blender 1](https://raw.githubusercontent.com/0dpe/path-tracer/main/doc/blender_export_gltf_1.jpg)
 /// ![Export glTF from Blender 2](https://raw.githubusercontent.com/0dpe/path-tracer/main/doc/blender_export_gltf_2.jpg)
 /// Be sure to check `Include > Custom Properties` and `Mesh > Apply Modifiers`.
-const GLTF: &str = "my cornell v2";
+const GLTF: &str = "box";
 
 use anyhow::Context;
 
