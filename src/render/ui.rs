@@ -25,6 +25,8 @@ pub fn style() -> egui::Style {
     ]
     .into();
 
+    style.animation_time = 0.0;
+
     let visuals = &mut style.visuals;
 
     visuals.weak_text_color = Some(Color32::RED); // ?
@@ -60,6 +62,8 @@ pub fn style() -> egui::Style {
     visuals.button_frame = true; // whether to show background and border for slider textbox
 
     visuals.collapsing_header_frame = false; // ?
+
+    visuals.window_highlight_topmost = false;
 
     visuals.interact_cursor = Some(CursorIcon::PointingHand);
 
@@ -116,23 +120,27 @@ fn key_label(ui: &mut egui::Ui, text: &str) {
     .show(ui, |ui| ui.monospace(text));
 }
 
-/// Run the UI. Should be called inside the closure for [`egui::Context::run_ui()`].
+/// What the user is doing in the UI, which [`run_base()`] returns.
+pub enum BaseUiAction {
+    UploadScene,
+    UploadSkybox,
+    UpdateSkyboxLuminance,
+}
+
+/// Run the base UI. Should be called inside the closure for [`egui::Context::run_ui()`].
 ///
-/// `selected_material_index` should come from [`scene::Scene::takeout_gpu_camera()`].
-/// `dt` is the change in time since the last frame in seconds, used to display the FPS in the UI.
-/// `frame_count` is displayed in the UI as just `{frame_count} Frames`.
-///
-/// Returns [`None`] when `selected_material_index` is [`None`] or when the user did not modify the material through the UI.
-/// If [`Some`] is returned, this [`usize`] value is the same as the `selected_material_index` value passed to this function.
-/// [`Some`] being returned means that the user modified the material at the [`usize`] index in [`scene::Scene::materials`], so this material has changed in [`scene::Scene`] already (as this function takes `&mut` to [`scene::Scene`]).
-/// Hence, when [`Some`] is returned, the caller can use the [`usize`] to, for example, call [`wgpu::Queue::write_buffer()`] to update any materials buffer.
-pub fn run(
-    root_ui: &mut egui::Ui,
+/// `dt` is the change in time since the last frame in seconds, used to display the FPS in this UI.
+/// `frame_count` is displayed in this UI as just `{frame_count} Frames`.
+/// `upload_status`, if not empty, is displayed below the buttons for uploading files.
+pub fn run_base(
+    root_ui: &egui::Ui,
     scene: &mut scene::Scene,
-    selected_material_index: Option<usize>,
+    skybox: &mut scene::Skybox,
     dt: f32,
     frame_count: u32,
-) -> Option<usize> {
+    upload_status: &str,
+    is_hovering: bool,
+) -> Vec<BaseUiAction> {
     // crosshair
     let raw_center = root_ui.available_rect_before_wrap().center();
     let center = egui::pos2(raw_center.x.round(), raw_center.y.round());
@@ -144,358 +152,439 @@ pub fn run(
     painter.line_segment([center - dy, center + dy], stroke);
 
     // frame count and FPS display
-    root_ui.with_layout(egui::Layout::top_down(egui::Align::RIGHT), |ui| {
-        egui::Frame::NONE
-            .inner_margin(egui::Margin {
-                left: 0,
-                right: 4,
-                top: 1,
-                bottom: 0,
-            })
-            .show(ui, |ui| {
-                ui.monospace(format!("{frame_count} Frames\n{} FPS", dt.recip().round()));
+    egui::Area::new(egui::Id::new("Frame count and FPS")) // Area takes stuff inside it out of the root_ui layout flow
+        .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-4.0, 0.0))
+        .show(root_ui.ctx(), |ui| {
+            ui.with_layout(egui::Layout::top_down(egui::Align::RIGHT), |ui| {
+                ui.monospace(format!("{frame_count} Frames\n{} FPS", dt.recip().round()))
             });
-    });
+        });
 
-    // hint and camera sliders
-    root_ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-        egui::Frame::window(ui.style())
-            .outer_margin(egui::Margin::same(6)) // to match the Material Properties window default_pos
-            .show(ui, |ui| {
-                ui.shrink_width_to_current();
+    let mut actions = Vec::new();
 
-                // fov
-                let mut fov_deg = scene.camera.fov_y().to_degrees();
-                let mut fov_slider = ui.add(
-                    egui::Slider::new(&mut fov_deg, 20.0..=150.0)
-                        .text("FOV")
-                        .suffix("°"),
-                );
-                if fov_slider.drag_stopped_by(egui::PointerButton::Secondary)
-                    || fov_slider.secondary_clicked()
-                {
-                    fov_deg = scene.initial().camera.fov_y().to_degrees();
-                    fov_slider.mark_changed();
-                }
-                if fov_slider.changed() {
-                    scene.camera.set_fov(fov_deg.to_radians());
-                }
+    // hint and sliders
+    egui::Area::new(egui::Id::new("Hint"))
+        .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(0.0, 0.0))
+        .show(root_ui.ctx(), |ui| {
+            egui::Frame::window(ui.style())
+                .outer_margin(egui::Margin::same(6)) // to match the Material Properties window default_pos
+                .show(ui, |ui| {
+                    ui.shrink_width_to_current(); // needed to shrink back when a wider collapsible is closed
 
-                let speed_slider =
-                    |ui: &mut egui::Ui, val: &mut f32, initial: f32, text: &str| -> bool {
-                        let mut response = ui.add(
-                            egui::Slider::new(val, (initial * 0.01)..=(initial * 5.0))
-                                .text(text)
-                                .custom_formatter(move |n, _| {
-                                    format!("{:.0}%", (n / f64::from(initial)) * 100.0)
-                                })
-                                .custom_parser(move |s| {
-                                    s.trim_end_matches('%')
-                                        .parse::<f64>()
-                                        .ok()
-                                        .map(|p| (p / 100.0) * f64::from(initial))
-                                }),
-                        );
-                        if response.drag_stopped_by(egui::PointerButton::Secondary)
-                            || response.secondary_clicked()
+                    let github_button_size = egui::vec2(18.0, 18.0);
+                    let mut github_row_rect = egui::Rect::NOTHING;
+
+                    ui.scope(|ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(3.0, 1.0);
+
+                        ui.horizontal(|ui| {
+                            ui.label("Enter / exit: Left click or");
+                            key_label(ui, "Esc");
+                        });
+
+                        ui.horizontal(|ui| {
+                            ui.label("Move:");
+                            for key in ["W", "A", "S", "D", "Shift", "Space"] {
+                                key_label(ui, key);
+                            }
+                            ui.add_space(github_button_size.x); // give some space for the GitHub button
+                        });
+
+                        github_row_rect = ui
+                            .horizontal(|ui| {
+                                ui.label("Toggle UI:");
+                                key_label(ui, "F1");
+                            })
+                            .response
+                            .rect;
+                    });
+
+                    let separator_y = ui.cursor().top();
+                    ui.add_space(ui.spacing().item_spacing.y * 2.0);
+
+                    ui.collapsing("Scene", |ui| {
+                        if ui.button("Upload scene (glb)").clicked() {
+                            actions.push(BaseUiAction::UploadScene);
+                        }
+
+                        if ui.button("Upload skybox (hdr/exr)").clicked() {
+                            actions.push(BaseUiAction::UploadSkybox);
+                        }
+
+                        if !upload_status.is_empty() {
+                            ui.label(upload_status);
+                        }
+
+                        let mut skybox_luminance = skybox.luminance;
+                        if ui
+                            .add(
+                                egui::Slider::new(&mut skybox_luminance, 0.0..=20_000.0)
+                                    .text("Skybox avg. nits"),
+                            )
+                            .changed()
                         {
-                            *val = initial;
-                            response.mark_changed();
+                            skybox.luminance = skybox_luminance;
+                            actions.push(BaseUiAction::UpdateSkyboxLuminance);
                         }
-                        response.changed()
-                    };
+                    });
 
-                let initial_rot = scene.initial().camera.rotation_speeds[0];
-                if speed_slider(
-                    ui,
-                    &mut scene.camera.rotation_speeds[0],
-                    initial_rot,
-                    "Rotation Speed",
-                ) {
-                    scene.camera.rotation_speeds[1] = scene.camera.rotation_speeds[0];
-                }
+                    ui.collapsing("Camera", |ui| {
+                        let pos = scene.camera.position();
+                        ui.label(format!(
+                            "({:.2}, {:.2}, {:.2})  ↔ {:.2}  ↕{:.2}",
+                            pos.x,
+                            pos.y,
+                            pos.z,
+                            scene.camera.yaw(),
+                            scene.camera.pitch(),
+                        ));
 
-                let initial_mov = scene.initial().camera.movement_speeds[0];
-                if speed_slider(
-                    ui,
-                    &mut scene.camera.movement_speeds[0],
-                    initial_mov,
-                    "Move Speed",
-                ) {
-                    scene.camera.movement_speeds[1] = scene.camera.movement_speeds[0];
-                }
-
-                let pos = scene.camera.position();
-                ui.label(format!(
-                    "({:.2}, {:.2}, {:.2})  ↔ {:.2}  ↕{:.2}",
-                    pos.x,
-                    pos.y,
-                    pos.z,
-                    scene.camera.yaw(),
-                    scene.camera.pitch(),
-                ));
-
-                ui.separator();
-
-                ui.spacing_mut().item_spacing = egui::vec2(3.0, 1.0);
-
-                ui.horizontal(|ui| {
-                    ui.label("Toggle UI:");
-                    key_label(ui, "F1");
-
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::BOTTOM), |ui| {
-                        let button_size = egui::vec2(18.0, 18.0);
-
-                        let (rect, response) =
-                            ui.allocate_exact_size(button_size, egui::Sense::click());
-
-                        if response.hovered() {
-                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        // fov
+                        let mut fov_deg = scene.camera.fov_y().to_degrees();
+                        let mut fov_slider = ui.add(
+                            egui::Slider::new(&mut fov_deg, 20.0..=150.0)
+                                .text("FOV")
+                                .suffix("°"),
+                        );
+                        if fov_slider.drag_stopped_by(egui::PointerButton::Secondary)
+                            || fov_slider.secondary_clicked()
+                        {
+                            fov_deg = scene.initial().camera.fov_y().to_degrees();
+                            fov_slider.mark_changed();
+                        }
+                        if fov_slider.changed() {
+                            scene.camera.set_fov(fov_deg.to_radians());
                         }
 
-                        let tint = if response.is_pointer_button_down_on() {
+                        let speed_slider =
+                            |ui: &mut egui::Ui, val: &mut f32, initial: f32, text: &str| -> bool {
+                                let mut response = ui.add(
+                                    egui::Slider::new(val, (initial * 0.01)..=(initial * 5.0))
+                                        .text(text)
+                                        .custom_formatter(move |n, _| {
+                                            format!("{:.0}%", (n / f64::from(initial)) * 100.0)
+                                        })
+                                        .custom_parser(move |s| {
+                                            s.trim_end_matches('%')
+                                                .parse::<f64>()
+                                                .ok()
+                                                .map(|p| (p / 100.0) * f64::from(initial))
+                                        }),
+                                );
+                                if response.drag_stopped_by(egui::PointerButton::Secondary)
+                                    || response.secondary_clicked()
+                                {
+                                    *val = initial;
+                                    response.mark_changed();
+                                }
+                                response.changed()
+                            };
+
+                        let initial_rot = scene.initial().camera.rotation_speeds[0];
+                        if speed_slider(
+                            ui,
+                            &mut scene.camera.rotation_speeds[0],
+                            initial_rot,
+                            "Rotation Speed",
+                        ) {
+                            scene.camera.rotation_speeds[1] = scene.camera.rotation_speeds[0];
+                        }
+
+                        let initial_mov = scene.initial().camera.movement_speeds[0];
+                        if speed_slider(
+                            ui,
+                            &mut scene.camera.movement_speeds[0],
+                            initial_mov,
+                            "Move Speed",
+                        ) {
+                            scene.camera.movement_speeds[1] = scene.camera.movement_speeds[0];
+                        }
+                    });
+
+                    let github_button_rect = egui::Rect::from_center_size(
+                        egui::pos2(
+                            ui.min_rect().right() - (github_button_size.x / 2.0),
+                            github_row_rect.center().y,
+                        ),
+                        github_button_size,
+                    );
+
+                    let github_button_response = ui.interact(
+                        github_button_rect,
+                        ui.id().with("Github Button"),
+                        egui::Sense::click(),
+                    );
+
+                    ui.put(
+                        github_button_rect,
+                        egui::Image::new(egui::include_image!(
+                            "../../assets/ui/GitHub_Invertocat_White.svg"
+                        ))
+                        .tint(if github_button_response.is_pointer_button_down_on() {
                             egui::Color32::from_gray(120)
-                        } else if response.hovered() {
+                        } else if github_button_response.hovered() {
                             egui::Color32::from_gray(200)
                         } else {
                             egui::Color32::WHITE
-                        };
+                        })
+                        .fit_to_exact_size(github_button_size)
+                        .alt_text("GitHub"),
+                    );
 
-                        ui.put(
-                            rect,
-                            egui::Image::new(egui::include_image!(
-                                "../../assets/ui/GitHub_Invertocat_White.svg"
-                            ))
-                            .tint(tint)
-                            .fit_to_exact_size(button_size)
-                            .alt_text("GitHub"),
-                        );
-
-                        if response.clicked() {
-                            ui.ctx().open_url(egui::OpenUrl::same_tab(
-                                "https://github.com/0dpe/path-tracer",
-                            ));
-                        }
-                    })
-                });
-
-                ui.horizontal(|ui| {
-                    ui.label("Move:");
-                    for key in ["W", "A", "S", "D", "Shift", "Space"] {
-                        key_label(ui, key);
+                    if github_button_response.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                     }
-                });
 
-                ui.horizontal(|ui| {
-                    ui.label("Enter / exit: Left click or");
-                    key_label(ui, "Esc");
-                });
-            });
-    });
-
-    let mut changed_mat_index = None;
-
-    if let Some(mat_index) = selected_material_index {
-        egui::Window::new(format!("Material {mat_index}"))
-            .id(egui::Id::new("Material Properties"))
-            .movable(true)
-            .collapsible(true)
-            .default_pos(egui::pos2(6.0, 6.0))
-            .default_width(305.0)
-            .scroll(true)
-            .show(root_ui.ctx(), |ui| {
-                let initial_mat = scene.initial().materials[mat_index];
-                let mat = &mut scene.materials[mat_index];
-                let mut mat_changed = false;
-
-                ui.horizontal(|ui| {
-                    ui.label("Right click to reset a slider.");
-
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
-                        if ui.button("Reset all").clicked() {
-                            *mat = initial_mat;
-                            mat_changed = true;
-                        }
-                    });
-                });
-
-                ui.separator();
-
-                let mat_slider = |ui: &mut egui::Ui,
-                                  val: &mut f32,
-                                  initial: f32,
-                                  range: std::ops::RangeInclusive<f32>,
-                                  text: &str|
-                 -> bool {
-                    let mut response = ui.add(egui::Slider::new(val, range).text(text));
-                    if response.drag_stopped_by(egui::PointerButton::Secondary)
-                        || response.secondary_clicked()
-                    {
-                        *val = initial;
-                        response.mark_changed();
+                    if github_button_response.clicked() {
+                        ui.ctx().open_url(egui::OpenUrl::same_tab(
+                            "https://github.com/0dpe/path-tracer",
+                        ));
                     }
-                    response.changed()
-                };
 
-                let color_rgba = |ui: &mut egui::Ui,
-                                  color: &mut glam::Vec4,
-                                  initial: glam::Vec4,
-                                  label: &str|
-                 -> bool {
-                    let mut arr = color.to_array();
-                    let mut changed = false;
-                    ui.horizontal(|ui| {
-                        let mut btn = ui.color_edit_button_rgba_unmultiplied(&mut arr); // linear
-                        if btn.secondary_clicked() {
-                            arr = initial.to_array();
-                            btn.mark_changed();
-                        }
-                        if btn.changed() {
-                            *color = glam::Vec4::from_array(arr);
-                            changed = true;
-                        }
-                        ui.label(label);
-                    });
-                    changed
-                };
+                    ui.painter().hline(
+                        ui.min_rect().x_range(),
+                        separator_y + ui.spacing().item_spacing.y,
+                        ui.visuals().widgets.noninteractive.bg_stroke,
+                    );
+                });
+        });
 
-                let color_rgb = |ui: &mut egui::Ui,
-                                 color: &mut glam::Vec4,
-                                 initial: glam::Vec4,
-                                 label: &str|
-                 -> bool {
-                    let mut arr = [color.x, color.y, color.z];
-                    let mut changed = false;
-                    ui.horizontal(|ui| {
-                        let mut btn = ui.color_edit_button_rgb(&mut arr); // linear
-                        if btn.secondary_clicked() {
-                            arr = [initial.x, initial.y, initial.z];
-                            btn.mark_changed();
-                        }
-                        if btn.changed() {
-                            color.x = arr[0];
-                            color.y = arr[1];
-                            color.z = arr[2];
-                            changed = true;
-                        }
-                        ui.label(label);
-                    });
-                    changed
-                };
+    if is_hovering {
+        let overlay_rect = root_ui.clip_rect(); // root_ui should cover the entire screen
 
-                mat_changed |= mat_slider(
-                    ui,
-                    &mut mat.OpenPBR_base_weight,
-                    initial_mat.OpenPBR_base_weight,
-                    0.0..=1.0,
-                    "Base Weight",
-                );
-                mat_changed |= color_rgba(
-                    ui,
-                    &mut mat.base_color_factor,
-                    initial_mat.base_color_factor,
-                    "Base Color",
-                );
-                mat_changed |= mat_slider(
-                    ui,
-                    &mut mat.roughness_factor,
-                    initial_mat.roughness_factor,
-                    0.0..=1.0,
-                    "Base Diffuse Roughness",
-                );
-                mat_changed |= mat_slider(
-                    ui,
-                    &mut mat.metallic_factor,
-                    initial_mat.metallic_factor,
-                    0.0..=1.0,
-                    "Base Metalness",
-                );
+        let painter = root_ui.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("File drop overlay"),
+        ));
 
-                mat_changed |= mat_slider(
-                    ui,
-                    &mut mat.specular_color_and_factor.w,
-                    initial_mat.specular_color_and_factor.w,
-                    0.0..=10.0,
-                    "Specular Weight",
-                );
-                mat_changed |= color_rgb(
-                    ui,
-                    &mut mat.specular_color_and_factor,
-                    initial_mat.specular_color_and_factor,
-                    "Specular Color",
-                );
+        painter.rect_filled(overlay_rect, 0.0, egui::Color32::from_black_alpha(150));
 
-                mat_changed |= mat_slider(
-                    ui,
-                    &mut mat.OpenPBR_specular_roughness,
-                    initial_mat.OpenPBR_specular_roughness,
-                    0.0..=1.0,
-                    "Specular Roughness",
-                );
-                mat_changed |=
-                    mat_slider(ui, &mut mat.ior, initial_mat.ior, 0.0..=3.0, "Specular IOR");
-                mat_changed |= mat_slider(
-                    ui,
-                    &mut mat.OpenPBR_specular_roughness_anisotropy,
-                    initial_mat.OpenPBR_specular_roughness_anisotropy,
-                    0.0..=1.0,
-                    "Specular Anisotropy",
-                );
-                mat_changed |= mat_slider(
-                    ui,
-                    &mut mat.OpenPBR_specular_haze,
-                    initial_mat.OpenPBR_specular_haze,
-                    0.0..=1.0,
-                    "Specular Haze",
-                );
-                mat_changed |= mat_slider(
-                    ui,
-                    &mut mat.OpenPBR_specular_haze_spread,
-                    initial_mat.OpenPBR_specular_haze_spread,
-                    0.0..=1.0,
-                    "Specular Haze Spread",
-                );
-                mat_changed |= mat_slider(
-                    ui,
-                    &mut mat.OpenPBR_specular_retroreflectivity,
-                    initial_mat.OpenPBR_specular_retroreflectivity,
-                    0.0..=1.0,
-                    "Specular Retroreflectivity",
-                );
+        painter.rect_stroke(
+            overlay_rect.shrink(24.0),
+            10.0,
+            egui::Stroke::new(2.0, egui::Color32::WHITE),
+            egui::StrokeKind::Inside,
+        );
 
-                mat_changed |= mat_slider(
-                    ui,
-                    &mut mat.OpenPBR_emission_weight,
-                    initial_mat.OpenPBR_emission_weight,
-                    0.0..=1.0,
-                    "Emission Weight",
-                );
-                mat_changed |= mat_slider(
-                    ui,
-                    &mut mat.emission_color_and_strength.w,
-                    initial_mat.emission_color_and_strength.w,
-                    0.0..=1_500_000.0,
-                    "Emission Luminance (nits)",
-                );
-                mat_changed |= color_rgb(
-                    ui,
-                    &mut mat.emission_color_and_strength,
-                    initial_mat.emission_color_and_strength,
-                    "Emission Color",
-                );
-                mat_changed |= mat_slider(
-                    ui,
-                    &mut mat.normal_scale,
-                    initial_mat.normal_scale,
-                    0.0..=10.0,
-                    "Normal Scale",
-                );
-
-                if mat_changed {
-                    changed_mat_index = Some(mat_index);
-                }
-            });
+        painter.text(
+            overlay_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "Drop file here",
+            egui::FontId::proportional(30.0),
+            egui::Color32::WHITE,
+        );
     }
 
-    changed_mat_index
+    actions
+}
+
+/// Run the UI for modifying a material. Should be called inside the closure for [`egui::Context::run_ui()`].
+///
+/// `material_index` should come from [`scene::Scene::takeout_gpu_camera()`] unwrapped.
+///
+/// Returns whether the user modified the material through this UI.
+/// When `true` is returned, the user modified the material at the `material_index` index in [`scene::Scene::materials`], so this material has changed in [`scene::Scene`] already (as this function takes `&mut` to [`scene::Scene`]).
+pub fn run_modify_material(
+    root_ui: &egui::Ui,
+    scene: &mut scene::Scene,
+    material_index: usize,
+) -> bool {
+    let mut mat_changed = false;
+
+    egui::Window::new(format!("Material {material_index}"))
+        .id(egui::Id::new("Material Properties"))
+        .movable(true)
+        .collapsible(true)
+        .default_pos(egui::pos2(6.0, 6.0))
+        .default_width(305.0)
+        .scroll(true)
+        .order(egui::Order::Middle)
+        .show(root_ui.ctx(), |ui| {
+            let initial_mat = scene.initial().materials[material_index];
+            let mat = &mut scene.materials[material_index];
+
+            ui.horizontal(|ui| {
+                ui.label("Right click to reset a slider.");
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+                    if ui.button("Reset all").clicked() {
+                        *mat = initial_mat;
+                        mat_changed = true;
+                    }
+                });
+            });
+
+            ui.separator();
+
+            let mat_slider = |ui: &mut egui::Ui,
+                              val: &mut f32,
+                              initial: f32,
+                              range: std::ops::RangeInclusive<f32>,
+                              text: &str|
+             -> bool {
+                let mut response = ui.add(egui::Slider::new(val, range).text(text));
+                if response.drag_stopped_by(egui::PointerButton::Secondary)
+                    || response.secondary_clicked()
+                {
+                    *val = initial;
+                    response.mark_changed();
+                }
+                response.changed()
+            };
+
+            let color_rgba = |ui: &mut egui::Ui,
+                              color: &mut glam::Vec4,
+                              initial: glam::Vec4,
+                              label: &str|
+             -> bool {
+                let mut arr = color.to_array();
+                let mut changed = false;
+                ui.horizontal(|ui| {
+                    let mut btn = ui.color_edit_button_rgba_unmultiplied(&mut arr); // linear
+                    if btn.secondary_clicked() {
+                        arr = initial.to_array();
+                        btn.mark_changed();
+                    }
+                    if btn.changed() {
+                        *color = glam::Vec4::from_array(arr);
+                        changed = true;
+                    }
+                    ui.label(label);
+                });
+                changed
+            };
+
+            let color_rgb = |ui: &mut egui::Ui,
+                             color: &mut glam::Vec4,
+                             initial: glam::Vec4,
+                             label: &str|
+             -> bool {
+                let mut arr = [color.x, color.y, color.z];
+                let mut changed = false;
+                ui.horizontal(|ui| {
+                    let mut btn = ui.color_edit_button_rgb(&mut arr); // linear
+                    if btn.secondary_clicked() {
+                        arr = [initial.x, initial.y, initial.z];
+                        btn.mark_changed();
+                    }
+                    if btn.changed() {
+                        color.x = arr[0];
+                        color.y = arr[1];
+                        color.z = arr[2];
+                        changed = true;
+                    }
+                    ui.label(label);
+                });
+                changed
+            };
+
+            mat_changed |= mat_slider(
+                ui,
+                &mut mat.OpenPBR_base_weight,
+                initial_mat.OpenPBR_base_weight,
+                0.0..=1.0,
+                "Base Weight",
+            );
+            mat_changed |= color_rgba(
+                ui,
+                &mut mat.base_color_factor,
+                initial_mat.base_color_factor,
+                "Base Color",
+            );
+            mat_changed |= mat_slider(
+                ui,
+                &mut mat.roughness_factor,
+                initial_mat.roughness_factor,
+                0.0..=1.0,
+                "Base Diffuse Roughness",
+            );
+            mat_changed |= mat_slider(
+                ui,
+                &mut mat.metallic_factor,
+                initial_mat.metallic_factor,
+                0.0..=1.0,
+                "Base Metalness",
+            );
+
+            mat_changed |= mat_slider(
+                ui,
+                &mut mat.specular_color_and_factor.w,
+                initial_mat.specular_color_and_factor.w,
+                0.0..=10.0,
+                "Specular Weight",
+            );
+            mat_changed |= color_rgb(
+                ui,
+                &mut mat.specular_color_and_factor,
+                initial_mat.specular_color_and_factor,
+                "Specular Color",
+            );
+
+            mat_changed |= mat_slider(
+                ui,
+                &mut mat.OpenPBR_specular_roughness,
+                initial_mat.OpenPBR_specular_roughness,
+                0.0..=1.0,
+                "Specular Roughness",
+            );
+            mat_changed |= mat_slider(ui, &mut mat.ior, initial_mat.ior, 0.0..=3.0, "Specular IOR");
+            mat_changed |= mat_slider(
+                ui,
+                &mut mat.OpenPBR_specular_roughness_anisotropy,
+                initial_mat.OpenPBR_specular_roughness_anisotropy,
+                0.0..=1.0,
+                "Specular Anisotropy",
+            );
+            mat_changed |= mat_slider(
+                ui,
+                &mut mat.OpenPBR_specular_haze,
+                initial_mat.OpenPBR_specular_haze,
+                0.0..=1.0,
+                "Specular Haze",
+            );
+            mat_changed |= mat_slider(
+                ui,
+                &mut mat.OpenPBR_specular_haze_spread,
+                initial_mat.OpenPBR_specular_haze_spread,
+                0.0..=1.0,
+                "Specular Haze Spread",
+            );
+            mat_changed |= mat_slider(
+                ui,
+                &mut mat.OpenPBR_specular_retroreflectivity,
+                initial_mat.OpenPBR_specular_retroreflectivity,
+                0.0..=1.0,
+                "Specular Retroreflectivity",
+            );
+
+            mat_changed |= mat_slider(
+                ui,
+                &mut mat.OpenPBR_emission_weight,
+                initial_mat.OpenPBR_emission_weight,
+                0.0..=1.0,
+                "Emission Weight",
+            );
+            mat_changed |= mat_slider(
+                ui,
+                &mut mat.emission_color_and_strength.w,
+                initial_mat.emission_color_and_strength.w,
+                0.0..=1_500_000.0,
+                "Emission Luminance (nits)",
+            );
+            mat_changed |= color_rgb(
+                ui,
+                &mut mat.emission_color_and_strength,
+                initial_mat.emission_color_and_strength,
+                "Emission Color",
+            );
+            mat_changed |= mat_slider(
+                ui,
+                &mut mat.normal_scale,
+                initial_mat.normal_scale,
+                0.0..=10.0,
+                "Normal Scale",
+            );
+        });
+
+    mat_changed
 }

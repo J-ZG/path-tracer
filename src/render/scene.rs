@@ -1,4 +1,4 @@
-//! Load and format a 3D scene stored in a .glb glTF 2.0 file for passing to the GPU.
+//! Load, format, and mange a 3D scene from a glTF 2.0 .glb file.
 
 // it's all pub instead of pub(crate) in this module because criterion, an external crate, is used to benchmark stuff in this module
 
@@ -15,12 +15,12 @@ pub const ATLAS_SIZE: u32 = 8192;
 
 // TODO: fix transparency in textures; parsing is done correctly, but shader is not correct. also, in gltf::material, parse alpha_mode and alpha_cutoff to do this properly
 // TODO: add vertex colors
-// TODO IP: wasm32 build failing due to bug in egui-winit, also version 30 greatly worsened performance and has lag spikes
-// TODO 2: allow user to use their own glb files
+// TODO IP: wasm32 build failing due to bug in egui-winit 30, also version 30 greatly worsened performance
+// TODO: there are lag spikes (not related to wgpu version 30), occurring at set amount of time elapsed after application first runs, which slows down frame rate by some percentage (not absolute change in frame rate)
 // TODO: render at a smaller resolution by default (maybe by somehow running an auto benchmark before anything runs to determine the user's hardware capabilities), and allow user to adjust resolution, so the app doesn't crash the user's computer
 
-/// Contains all the data loaded from a glTF file and formatted for the GPU.
-/// 
+/// Contains all the data loaded from a glTF 2.0 .glb file, formatted for the GPU.
+///
 /// The coordinate system is: +X to the right of the screen, +Y up the screen, and -Z into the screen.
 pub struct Scene {
     // geometries[i] and attributes[i] together represent a triangle at index i
@@ -44,10 +44,20 @@ pub struct Scene {
     initial: Initial,
 }
 
-/// Stores scene data that [`Scene::new()`] originally generated, before any other code modifies the public fields of these structs.
+/// Stores scene data that [`Scene::new()`] originally generated, before any other code modifies the public fields of these structs. Get with [`Scene::initial()`].
 pub struct Initial {
     pub materials: Vec<GpuMaterial>,
     pub camera: Camera,
+}
+
+/// Contains skybox texture data formatted for the GPU.
+pub struct Skybox { // not GpuSkybox because this struct itself is not passed to the GPU
+    /// Should be the average luminance of the skybox in nits.
+    pub luminance: f32,
+    pub width: u32,
+    pub height: u32,
+    /// The equirectangular linear texture, with each pixel's values scaled so that the average luminance is 1 nit.
+    pub rgba: Vec<f32>,
 }
 
 /// Used for keeping track of camera data internally; not passed to the GPU.
@@ -349,59 +359,8 @@ impl bevy_mikktspace::Geometry for MikkTSpaceGeometry<'_> {
 }
 
 impl Scene {
-    /// Load a glTF file from the given path and format it for the GPU.
-    #[allow(clippy::unused_async)] // async is used on web for getting response for loading the glb file
-    #[allow(clippy::future_not_send)]
-    pub async fn new(path: &str) -> anyhow::Result<Self> {
-        // on both native and wasm, loading is at runtime
-        // this allows the glTF file to change without having to rebuild the WASM
-        #[allow(unused_mut)]
-        let mut bytes;
-
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            bytes = std::fs::read(path)?;
-        }
-
-        #[cfg(target_arch = "wasm32")]
-        {
-            use wasm_bindgen::JsCast; // trait for dyn_into()
-
-            let response: web_sys::Response = wasm_bindgen_futures::JsFuture::from(
-                web_sys::window()
-                    .context("get web_sys window failed")?
-                    .fetch_with_str(path),
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("error fetching {path}: {e:?}"))?
-            .dyn_into()
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "failed to cast resolved fetch response to web_sys::Response: {e:?}"
-                )
-            })?;
-
-            if !response.ok() {
-                anyhow::bail!(
-                    "network error: HTTP {} {}",
-                    response.status(),
-                    response.status_text()
-                );
-            }
-
-            let u8_array = js_sys::Uint8Array::new(
-                &wasm_bindgen_futures::JsFuture::from(
-                    response
-                        .array_buffer()
-                        .map_err(|e| anyhow::anyhow!("response.array_buffer error: {e:?}"))?,
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("JsFuture::from(array_buffer) error: {e:?}"))?,
-            );
-            bytes = vec![0u8; u8_array.length() as usize];
-            u8_array.copy_to(&mut bytes[..]);
-        }
-
+    /// Format .glb byte data for the GPU.
+    pub fn new(bytes: &[u8]) -> anyhow::Result<Self> {
         let (document, buffers, images) = gltf::import_slice(bytes)?;
 
         let mut geometries = Vec::new();
@@ -768,17 +727,13 @@ impl Scene {
                             // if idx is not in material_cache, run the closure, which also stores the new index in material_cache since or_insert_with returns &mut material_cache[idx]
                             *material_cache.entry(idx).or_insert_with(|| {
                                 let new_idx = materials.len() as u32;
-                                materials.push(Self::parse_gpu_material(
-                                    &mat,
-                                    &srgb_uvs,
-                                    &linear_uvs,
-                                ));
+                                materials.push(GpuMaterial::new(&mat, &srgb_uvs, &linear_uvs));
                                 new_idx
                             })
                         } else {
                             // if there's no index, caching is impossible, so just parse the material and push it to the materials vec without caching
                             let new_idx = materials.len() as u32;
-                            materials.push(Self::parse_gpu_material(&mat, &srgb_uvs, &linear_uvs));
+                            materials.push(GpuMaterial::new(&mat, &srgb_uvs, &linear_uvs));
                             new_idx
                         };
 
@@ -838,13 +793,6 @@ impl Scene {
             stack.extend(node.children().map(|child| (child, model_mat)));
         }
 
-        let mut bvh_nodes = vec![GpuBvhNode {
-            aabb_min: glam::Vec3::ZERO,
-            left_first: 0,
-            aabb_max: glam::Vec3::ZERO,
-            tri_count: 0,
-        }];
-
         log::info!(
             "Loaded scene with {} triangles, {} materials, {} linear and {} sRGB texture atlases",
             geometries.len(),
@@ -854,6 +802,13 @@ impl Scene {
         );
 
         let bvh_construction_start = web_time::Instant::now();
+
+        let mut bvh_nodes = vec![GpuBvhNode {
+            aabb_min: glam::Vec3::ZERO,
+            left_first: 0,
+            aabb_max: glam::Vec3::ZERO,
+            tri_count: 0,
+        }];
 
         // start recursive BVH construction
         if !tri_infos.is_empty() {
@@ -917,165 +872,6 @@ impl Scene {
         }
 
         Ok(scene)
-    }
-
-    /// Convert a glTF material into a [`GpuMaterial`] for passing to the GPU, using the provided mapping of image indices to atlas layers and UV offset/scale.
-    // not a closure inside new() because using a function seems slightly faster
-    fn parse_gpu_material(
-        mat: &gltf::Material,
-        srgb_image_uvs: &std::collections::HashMap<usize, (i32, glam::Vec4)>,
-        linear_image_uvs: &std::collections::HashMap<usize, (i32, glam::Vec4)>,
-    ) -> GpuMaterial {
-        let get_srgb_layer_and_uv = |img_idx_opt: Option<usize>| -> (i32, glam::Vec4) {
-            img_idx_opt
-                .and_then(|idx| srgb_image_uvs.get(&idx).copied())
-                .unwrap_or((-1, glam::Vec4::ZERO)) // return -1 layer and zero UV if no texture attached
-        };
-        let get_linear_layer_and_uv = |img_idx_opt: Option<usize>| -> (i32, glam::Vec4) {
-            img_idx_opt
-                .and_then(|idx| linear_image_uvs.get(&idx).copied())
-                .unwrap_or((-1, glam::Vec4::ZERO))
-        };
-
-        let pbr = mat.pbr_metallic_roughness();
-
-        let (base_color_tex_layer, base_color_uv) = get_srgb_layer_and_uv(
-            pbr.base_color_texture()
-                .map(|t| t.texture().source().index()),
-        );
-
-        let (metallic_roughness_tex_layer, metallic_roughness_uv) = get_linear_layer_and_uv(
-            pbr.metallic_roughness_texture()
-                .map(|t| t.texture().source().index()),
-        );
-
-        let norm_tex = mat.normal_texture();
-        let (normal_tex_layer, normal_uv) =
-            get_linear_layer_and_uv(norm_tex.as_ref().map(|t| t.texture().source().index()));
-
-        let (emission_tex_layer, emission_uv) =
-            get_srgb_layer_and_uv(mat.emissive_texture().map(|t| t.texture().source().index()));
-
-        let specular = mat.specular();
-        let (specular_factor_tex_layer, specular_factor_uv) = get_linear_layer_and_uv(
-            specular
-                .as_ref()
-                .and_then(gltf::material::Specular::specular_texture)
-                .map(|t| t.texture().source().index()),
-        );
-        let (specular_color_tex_layer, specular_color_uv) = get_srgb_layer_and_uv(
-            specular
-                .as_ref()
-                .and_then(gltf::material::Specular::specular_color_texture)
-                .map(|t| t.texture().source().index()),
-        );
-
-        #[expect(non_snake_case)]
-        let mut OpenPBR_base_weight = 1.0;
-        #[expect(non_snake_case)]
-        let mut OpenPBR_emission_weight = 0.0;
-        #[expect(non_snake_case)]
-        let mut OpenPBR_specular_roughness = 0.3;
-        #[expect(non_snake_case)]
-        let mut OpenPBR_specular_roughness_anisotropy = 0.0;
-        #[expect(non_snake_case)]
-        let mut OpenPBR_specular_haze = 0.0;
-        #[expect(non_snake_case)]
-        let mut OpenPBR_specular_haze_spread = 0.3;
-        #[expect(non_snake_case)]
-        let mut OpenPBR_specular_retroreflectivity = 0.0;
-        if let Some(extras) = mat.extras() {
-            match serde_json::from_str::<serde_json::Value>(extras.get()) {
-                Ok(serde_json::Value::Object(map)) => {
-                    // for now, all these OpenPBR values from extras are f32 in [0, 1]
-                    let apply_extra = |key: &str, val: &serde_json::Value, target: &mut f32| {
-                        if let Some(v_f64) = val.as_f64() {
-                            let v_f32 = v_f64 as f32;
-                            if (0.0..=1.0).contains(&v_f32) {
-                                *target = v_f32;
-                            } else {
-                                log::warn!("{key} value {v_f32} is out of range [0, 1]");
-                            }
-                        } else {
-                            log::warn!("{key} value is not a float");
-                        }
-                    };
-
-                    for (k, v) in map {
-                        match k.as_str() {
-                            "OpenPBR_base_weight" => apply_extra(&k, &v, &mut OpenPBR_base_weight),
-                            "OpenPBR_emission_weight" => {
-                                apply_extra(&k, &v, &mut OpenPBR_emission_weight);
-                            }
-                            "OpenPBR_specular_roughness" => {
-                                apply_extra(&k, &v, &mut OpenPBR_specular_roughness);
-                            }
-                            "OpenPBR_specular_roughness_anisotropy" => {
-                                apply_extra(&k, &v, &mut OpenPBR_specular_roughness_anisotropy);
-                            }
-                            "OpenPBR_specular_haze" => {
-                                apply_extra(&k, &v, &mut OpenPBR_specular_haze);
-                            }
-                            "OpenPBR_specular_haze_spread" => {
-                                apply_extra(&k, &v, &mut OpenPBR_specular_haze_spread);
-                            }
-                            "OpenPBR_specular_retroreflectivity" => {
-                                apply_extra(&k, &v, &mut OpenPBR_specular_retroreflectivity);
-                            }
-                            _ => log::warn!("Unrecognized key in pbrMetallicRoughness.extras: {k}"),
-                        }
-                    }
-                }
-                Ok(_) => {
-                    log::warn!("pbrMetallicRoughness.extras is not a JSON object");
-                }
-                Err(e) => {
-                    log::warn!("Failed to parse pbrMetallicRoughness.extras: {e}");
-                }
-            }
-        }
-
-        GpuMaterial {
-            base_color_factor: glam::Vec4::from(pbr.base_color_factor()),
-            OpenPBR_base_weight,
-            metallic_factor: pbr.metallic_factor(),
-            roughness_factor: pbr.roughness_factor(),
-            OpenPBR_emission_weight,
-            emission_color_and_strength: glam::Vec4::from((
-                glam::Vec3::from(mat.emissive_factor()),
-                mat.emissive_strength().unwrap_or(1.0),
-            )),
-            specular_color_and_factor: glam::Vec4::from((
-                glam::Vec3::from(specular.as_ref().map_or(
-                    [1.0, 1.0, 1.0],
-                    gltf::material::Specular::specular_color_factor,
-                )),
-                specular.map_or(1.0, |s| s.specular_factor()),
-            )),
-            OpenPBR_specular_roughness,
-            OpenPBR_specular_roughness_anisotropy,
-            OpenPBR_specular_haze,
-            OpenPBR_specular_haze_spread,
-            ior: mat.ior().unwrap_or(1.5),
-            OpenPBR_specular_retroreflectivity,
-            normal_scale: norm_tex.map_or(1.0, |t| t.scale()),
-
-            pad: [0.0; 3],
-
-            base_color_tex_layer,
-            normal_tex_layer,
-            metallic_roughness_tex_layer,
-            emission_tex_layer,
-            specular_factor_tex_layer,
-            specular_color_tex_layer,
-
-            base_color_uv,
-            normal_uv,
-            metallic_roughness_uv,
-            emission_uv,
-            specular_factor_uv,
-            specular_color_uv,
-        }
     }
 
     /// Update the BVH node's bounding box based on the triangles it spans.
@@ -1283,7 +1079,7 @@ impl Scene {
         &self.initial
     }
 
-    /// Get the [`GpuCamera`] struct for the GPU with the current [`Camera`] values and determine which triangle the camera is directly pointed at, returning that triangle's material's index in [`Scene::materials`].
+    /// Get the [`GpuCamera`] struct for the GPU with the current [`Scene::camera`] values and determine which triangle the camera is directly pointed at, returning that triangle's material's index in [`Scene::materials`].
     ///
     /// Returns [`None`] and does no calculations if camera wasn't dirty. Otherwise, calculates fields in [`GpuCamera`], then sets camera dirty to false.
     // not a method in impl Camera because this method also needs read access to Scene stuff
@@ -1554,8 +1350,211 @@ impl Scene {
     }
 }
 
+impl Skybox {
+    /// Create a new [`Skybox`] using [`image::load_from_memory()`] with the given `bytes`.
+    pub fn new(bytes: &[u8]) -> anyhow::Result<Self> {
+        let img = image::load_from_memory(bytes)?.into_rgba32f();
+        let (width, height) = img.dimensions();
+        let mut pixels = img.into_raw();
+
+        let mut total_luma = 0.0;
+
+        for i in (0..pixels.len()).step_by(4) {
+            let r = pixels[i];
+            let g = pixels[i + 1];
+            let b = pixels[i + 2];
+            total_luma += r.mul_add(0.2126, g.mul_add(0.7152, b * 0.0722)); // standard Rec. 709 coefficients to convert RGB -> luminance value
+        }
+
+        let avg_luma = total_luma / (width * height) as f32;
+
+        let scale_factor = if avg_luma > 0.0 {
+            avg_luma.recip()
+        } else {
+            1.0
+        };
+
+        for i in (0..pixels.len()).step_by(4) {
+            pixels[i] *= scale_factor;
+            pixels[i + 1] *= scale_factor;
+            pixels[i + 2] *= scale_factor;
+            // pixels[i+3] is alpha, leave it alone
+        }
+
+        Ok(Self {
+            // this preserves the skybox's original average luminance
+            luminance: avg_luma,
+            width,
+            height,
+            rgba: pixels,
+        })
+    }
+}
+
+impl GpuMaterial {
+    /// Convert a glTF 2.0 material into a [`GpuMaterial`] for passing to the GPU, using the provided mapping of image indices to atlas layers and UV offset/scale.
+    fn new(
+        mat: &gltf::Material,
+        srgb_image_uvs: &std::collections::HashMap<usize, (i32, glam::Vec4)>,
+        linear_image_uvs: &std::collections::HashMap<usize, (i32, glam::Vec4)>,
+    ) -> Self {
+        let get_srgb_layer_and_uv = |img_idx_opt: Option<usize>| -> (i32, glam::Vec4) {
+            img_idx_opt
+                .and_then(|idx| srgb_image_uvs.get(&idx).copied())
+                .unwrap_or((-1, glam::Vec4::ZERO)) // return -1 layer and zero UV if no texture attached
+        };
+        let get_linear_layer_and_uv = |img_idx_opt: Option<usize>| -> (i32, glam::Vec4) {
+            img_idx_opt
+                .and_then(|idx| linear_image_uvs.get(&idx).copied())
+                .unwrap_or((-1, glam::Vec4::ZERO))
+        };
+
+        let pbr = mat.pbr_metallic_roughness();
+
+        let (base_color_tex_layer, base_color_uv) = get_srgb_layer_and_uv(
+            pbr.base_color_texture()
+                .map(|t| t.texture().source().index()),
+        );
+
+        let (metallic_roughness_tex_layer, metallic_roughness_uv) = get_linear_layer_and_uv(
+            pbr.metallic_roughness_texture()
+                .map(|t| t.texture().source().index()),
+        );
+
+        let norm_tex = mat.normal_texture();
+        let (normal_tex_layer, normal_uv) =
+            get_linear_layer_and_uv(norm_tex.as_ref().map(|t| t.texture().source().index()));
+
+        let (emission_tex_layer, emission_uv) =
+            get_srgb_layer_and_uv(mat.emissive_texture().map(|t| t.texture().source().index()));
+
+        let specular = mat.specular();
+        let (specular_factor_tex_layer, specular_factor_uv) = get_linear_layer_and_uv(
+            specular
+                .as_ref()
+                .and_then(gltf::material::Specular::specular_texture)
+                .map(|t| t.texture().source().index()),
+        );
+        let (specular_color_tex_layer, specular_color_uv) = get_srgb_layer_and_uv(
+            specular
+                .as_ref()
+                .and_then(gltf::material::Specular::specular_color_texture)
+                .map(|t| t.texture().source().index()),
+        );
+
+        #[expect(non_snake_case)]
+        let mut OpenPBR_base_weight = 1.0;
+        #[expect(non_snake_case)]
+        let mut OpenPBR_emission_weight = 0.0;
+        #[expect(non_snake_case)]
+        let mut OpenPBR_specular_roughness = 0.3;
+        #[expect(non_snake_case)]
+        let mut OpenPBR_specular_roughness_anisotropy = 0.0;
+        #[expect(non_snake_case)]
+        let mut OpenPBR_specular_haze = 0.0;
+        #[expect(non_snake_case)]
+        let mut OpenPBR_specular_haze_spread = 0.3;
+        #[expect(non_snake_case)]
+        let mut OpenPBR_specular_retroreflectivity = 0.0;
+        if let Some(extras) = mat.extras() {
+            match serde_json::from_str::<serde_json::Value>(extras.get()) {
+                Ok(serde_json::Value::Object(map)) => {
+                    // for now, all these OpenPBR values from extras are f32 in [0, 1]
+                    let apply_extra = |key: &str, val: &serde_json::Value, target: &mut f32| {
+                        if let Some(v_f64) = val.as_f64() {
+                            let v_f32 = v_f64 as f32;
+                            if (0.0..=1.0).contains(&v_f32) {
+                                *target = v_f32;
+                            } else {
+                                log::warn!("{key} value {v_f32} is out of range [0, 1]");
+                            }
+                        } else {
+                            log::warn!("{key} value is not a float");
+                        }
+                    };
+
+                    for (k, v) in map {
+                        match k.as_str() {
+                            "OpenPBR_base_weight" => apply_extra(&k, &v, &mut OpenPBR_base_weight),
+                            "OpenPBR_emission_weight" => {
+                                apply_extra(&k, &v, &mut OpenPBR_emission_weight);
+                            }
+                            "OpenPBR_specular_roughness" => {
+                                apply_extra(&k, &v, &mut OpenPBR_specular_roughness);
+                            }
+                            "OpenPBR_specular_roughness_anisotropy" => {
+                                apply_extra(&k, &v, &mut OpenPBR_specular_roughness_anisotropy);
+                            }
+                            "OpenPBR_specular_haze" => {
+                                apply_extra(&k, &v, &mut OpenPBR_specular_haze);
+                            }
+                            "OpenPBR_specular_haze_spread" => {
+                                apply_extra(&k, &v, &mut OpenPBR_specular_haze_spread);
+                            }
+                            "OpenPBR_specular_retroreflectivity" => {
+                                apply_extra(&k, &v, &mut OpenPBR_specular_retroreflectivity);
+                            }
+                            _ => log::warn!("Unrecognized key in pbrMetallicRoughness.extras: {k}"),
+                        }
+                    }
+                }
+                Ok(_) => {
+                    log::warn!("pbrMetallicRoughness.extras is not a JSON object");
+                }
+                Err(e) => {
+                    log::warn!("Failed to parse pbrMetallicRoughness.extras: {e}");
+                }
+            }
+        }
+
+        Self {
+            base_color_factor: glam::Vec4::from(pbr.base_color_factor()),
+            OpenPBR_base_weight,
+            metallic_factor: pbr.metallic_factor(),
+            roughness_factor: pbr.roughness_factor(),
+            OpenPBR_emission_weight,
+            emission_color_and_strength: glam::Vec4::from((
+                glam::Vec3::from(mat.emissive_factor()),
+                mat.emissive_strength().unwrap_or(1.0),
+            )),
+            specular_color_and_factor: glam::Vec4::from((
+                glam::Vec3::from(specular.as_ref().map_or(
+                    [1.0, 1.0, 1.0],
+                    gltf::material::Specular::specular_color_factor,
+                )),
+                specular.map_or(1.0, |s| s.specular_factor()),
+            )),
+            OpenPBR_specular_roughness,
+            OpenPBR_specular_roughness_anisotropy,
+            OpenPBR_specular_haze,
+            OpenPBR_specular_haze_spread,
+            ior: mat.ior().unwrap_or(1.5),
+            OpenPBR_specular_retroreflectivity,
+            normal_scale: norm_tex.map_or(1.0, |t| t.scale()),
+
+            pad: [0.0; 3],
+
+            base_color_tex_layer,
+            normal_tex_layer,
+            metallic_roughness_tex_layer,
+            emission_tex_layer,
+            specular_factor_tex_layer,
+            specular_color_tex_layer,
+
+            base_color_uv,
+            normal_uv,
+            metallic_roughness_uv,
+            emission_uv,
+            specular_factor_uv,
+            specular_color_uv,
+        }
+    }
+}
+
 impl Camera {
     /// Calculate decent starting camera values from scene bounds.
+    ///
+    /// Initializes [`Camera::dirty`] to `true`.
     fn new(aabb_min: glam::Vec3, aabb_max: glam::Vec3) -> Self {
         let scene_center = (aabb_min + aabb_max) * 0.5;
         Self {

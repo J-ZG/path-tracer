@@ -49,6 +49,10 @@ winit = { version = "0.30.13", default-features = false, features = [
     "wayland-dlopen",
     "rwh_06",
 ] }
+rfd = { version = "0.17.2", default-features = false, features = [
+    "wayland",
+    "xdg-portal",
+] }
 gltf = { version = "1.4.1", default-features = false, features = [
     "import",
     "utils",
@@ -60,7 +64,7 @@ gltf = { version = "1.4.1", default-features = false, features = [
 image = { version = "0.25.10", default-features = false, features = [
     "exr",
     "hdr",
-] } # TODO
+] }
 bytemuck = { version = "1.25.2", default-features = false, features = [
     "derive",
 ] }
@@ -91,7 +95,7 @@ anyhow = { version = "1.0.104", default-features = false }
 wasm-bindgen = { version = "0.2.127", default-features = false }
 wasm-bindgen-futures = { version = "0.4.77", default-features = false }
 web-sys = { version = "0.3.104", default-features = false, features = [
-    # for getting the .glb file on the web, in src/render/scene.rs 
+    # for getting the .glb file on the web 
     "Response",
     # for logger.rs
     "CustomEvent",

@@ -2,13 +2,16 @@
 //!
 //! Includes methods for initializing these resources and handling events from the window.
 
-/// The name of the glTF file to load from the [`assets/glb/`](https://github.com/0dpe/path-tracer/tree/main/assets/glb) directory to render.
+/// The name of the glTF 2.0 .glb file to load from the [`assets/glb/`](https://github.com/0dpe/path-tracer/tree/main/assets/glb) directory to render by default.
 ///
 /// Can be exported from Blender.
 /// ![Export glTF from Blender 1](https://raw.githubusercontent.com/0dpe/path-tracer/main/doc/blender_export_gltf_1.jpg)
 /// ![Export glTF from Blender 2](https://raw.githubusercontent.com/0dpe/path-tracer/main/doc/blender_export_gltf_2.jpg)
 /// Be sure to check `Include > Custom Properties` and `Mesh > Apply Modifiers`.
-const GLTF: &str = "box";
+const SCENE: &str = "box.glb";
+
+/// The name of the skybox hdr or exr file to load from the [`assets/skybox/`](https://github.com/0dpe/path-tracer/tree/main/assets/skybox) directory to render by default.
+const SKYBOX: &str = "kloppenheim_06_puresky_4k.exr"; // https://polyhaven.com/a/kloppenheim_06_puresky
 
 use anyhow::Context;
 
@@ -35,12 +38,17 @@ pub struct State {
     /// Bind group layout for [`State::render_0_bind_group`], needed here to recreate the bind group on window resizes.
     render_0_bind_group_layout: wgpu::BindGroupLayout,
 
-    /// Bind group 1 for the compute shader, containing mostly scene data. This bind group is separated from group 0 because this group never needs to be recreated during runtime (hence, its layout also isn't stored in this struct).
+    /// Bind group 1 for the compute shader, containing mostly scene data. This bind group is separated from group 0 because this group is recreated only when resources like the scene or skybox reload.
     compute_1_bind_group: wgpu::BindGroup,
+    /// Bind group layout for [`State::compute_1_bind_group`], needed here to recreate the bind group when resources like the scene or skybox reload.
+    compute_1_bind_group_layout: wgpu::BindGroupLayout,
+
     /// Buffer for camera data. Written to when the camera moves.
     camera_buffer: wgpu::Buffer,
     /// Buffer for frame count value used by the shader for accumulation and RNG seeding. Written to every frame with [`State::frame_count`].
     frame_count_buffer: wgpu::Buffer,
+    /// Buffer for skybox luminance data. Written to when the user modifies the luminance through the UI.
+    skybox_luminance_buffer: wgpu::Buffer,
     /// Buffer for material data. Written to when the user modifies a material through the UI.
     materials_buffer: wgpu::Buffer,
 
@@ -49,8 +57,10 @@ pub struct State {
     /// Runs the vertex and fragment shaders.
     render_pipeline: wgpu::RenderPipeline,
 
-    /// Contains all data about the 3D scene.
+    /// Manages scene data.
     scene: scene::Scene,
+    /// Manages skybox data.
+    skybox: scene::Skybox,
 
     /// Tracks the current mode the user is in, either in cursor free or cursor grabbed mode.
     user_mode: UserMode,
@@ -87,6 +97,13 @@ pub struct State {
     #[cfg(all(feature = "testing", not(target_arch = "wasm32")))]
     profiler: wgpu_profiler::GpuProfiler,
 
+    /// Receiver for user-given files.
+    file_receiver: std::sync::mpsc::Receiver<UploadedFile>,
+    /// Sender for user-given files.
+    file_sender: std::sync::mpsc::Sender<UploadedFile>,
+    /// What to display in the UI regarding file uploads.
+    file_upload_status: String,
+
     /// The window.
     pub(crate) window: std::sync::Arc<winit::window::Window>,
 }
@@ -97,6 +114,12 @@ pub struct State {
 enum UserMode {
     CursorFree,
     CursorGrabbed(std::collections::HashSet<winit::keyboard::KeyCode>),
+}
+
+/// Holds the byte data for an uploaded scene or skybox.
+enum UploadedFile {
+    Scene(Vec<u8>),
+    Skybox(Vec<u8>),
 }
 
 impl State {
@@ -131,6 +154,22 @@ impl State {
 
         // create surface, which targets the given winit window
         let surface = instance.create_surface(std::sync::Arc::clone(&window))?;
+        let surface_config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format: wgpu::TextureFormat::Bgra8Unorm, // Bgra8Unorm should be a guaranteed supported format
+            // sometimes on web initial page load, the canvas can have window.inner_size().width of 0
+            // 0 length or width causes surface.configure() to panic
+            // so, .max(1) makes sure that width and height are never less than 1
+            // this is a standard solution: https://github.com/gfx-rs/wgpu/blob/04129aadaffb7fc72627102531633342f7cf90db/examples/features/src/hello_triangle/mod.rs#L66
+            width: window.inner_size().width.max(1),
+            height: window.inner_size().height.max(1),
+            present_mode: wgpu::PresentMode::AutoNoVsync, // no vsync allows the program to run as fast as possible, giving better visual results when the GPU can calculate faster than the monitor refresh rate
+            desired_maximum_frame_latency: 2,
+            alpha_mode: wgpu::CompositeAlphaMode::Auto,
+            view_formats: vec![wgpu::TextureFormat::Bgra8Unorm],
+            // TODO: 30
+            // color_space: wgpu::SurfaceColorSpace::Auto,
+        };
 
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
@@ -141,22 +180,30 @@ impl State {
                 // apply_limit_buckets: false,
             })
             .await?;
-        log::info!("Using adapter: {}", adapter.get_info().name); // doesn't log the name on web for some reason, but logs fine on native
+
         let supported_limits = adapter.limits(); // get the maximum limits the physical hardware supports
+
         log::info!(
-            "Max storage buffer binding size: {} MiB",
-            supported_limits.max_storage_buffer_binding_size as f32 / 1024.0 / 1024.0
+            "Using adapter: {}\nMax storage buffer binding size: {} MiB\nMax texture dimension 2D: {}",
+            adapter.get_info().name,
+            supported_limits.max_storage_buffer_binding_size as f32 / 1024.0 / 1024.0,
+            supported_limits.max_texture_dimension_2d
         );
-        // log::info!(
-        //     "Max texture dimension 2D: {}",
-        //     supported_limits.max_texture_dimension_2d
-        // );
+
+        // see which TextureFormat's are supported by the surface
+        // Bgra8Unorm and Bgra8UnormSrgb should be guaranteed, but on web, Bgra8UnormSrgb isn't supported it seems
+        // for example, on Windows native, [Bgra8UnormSrgb, Rgba8UnormSrgb, Bgra8Unorm, Rgba8Unorm, Rgba16Float, Rgb10a2Unorm] are supported, but with Chrome or Firefox, only [Bgra8Unorm, Rgba8Unorm, Rgba16Float] are supported
+        log::info!(
+            "Surface formats: {:?}",
+            surface.get_capabilities(&adapter).formats
+        );
 
         #[cfg(all(feature = "testing", not(target_arch = "wasm32")))]
-        let required_features =
-            adapter.features() & wgpu_profiler::GpuProfiler::ALL_WGPU_TIMER_FEATURES; // for wgpu_profiler
+        let required_features = (adapter.features()
+            & wgpu_profiler::GpuProfiler::ALL_WGPU_TIMER_FEATURES) // for wgpu_profiler
+            | wgpu::Features::FLOAT32_FILTERABLE; // highly supported: https://web3dsurvey.com/webgpu/features/float32-filterable
         #[cfg(not(all(feature = "testing", not(target_arch = "wasm32"))))]
-        let required_features = wgpu::Features::empty();
+        let required_features = wgpu::Features::FLOAT32_FILTERABLE;
 
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
@@ -173,6 +220,10 @@ impl State {
                 trace: wgpu::Trace::Off,
             })
             .await?;
+
+        // update() only works when the surface is configured
+        // update() is often called right after new(), and resize() isn't called unless a resize happens, so configuring surface here is necessary
+        surface.configure(&device, &surface_config);
 
         let egui_wgpu_renderer = egui_wgpu::Renderer::new(
             &device,
@@ -191,36 +242,7 @@ impl State {
             &queue,
         )?;
 
-        // see which TextureFormat's are supported by the surface
-        // Bgra8Unorm and Bgra8UnormSrgb should be guaranteed, but on web, Bgra8UnormSrgb isn't supported it seems
-        // for example, on Windows native, [Bgra8UnormSrgb, Rgba8UnormSrgb, Bgra8Unorm, Rgba8Unorm, Rgba16Float, Rgb10a2Unorm] are supported, but with Chrome or Firefox, only [Bgra8Unorm, Rgba8Unorm, Rgba16Float] are supported
-        log::info!(
-            "Surface formats: {:?}",
-            surface.get_capabilities(&adapter).formats
-        );
-
-        let surface_config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format: wgpu::TextureFormat::Bgra8Unorm, // Bgra8Unorm should be a guaranteed supported format
-            // sometimes on web initial page load, the canvas can have window.inner_size().width of 0
-            // 0 length or width causes surface.configure() to panic
-            // so, .max(1) makes sure that width and height are never less than 1
-            // this is a standard solution: https://github.com/gfx-rs/wgpu/blob/04129aadaffb7fc72627102531633342f7cf90db/examples/features/src/hello_triangle/mod.rs#L66
-            width: window.inner_size().width.max(1),
-            height: window.inner_size().height.max(1),
-            present_mode: wgpu::PresentMode::AutoNoVsync, // no vsync allows the program to run as fast as possible, giving better visual results when the GPU can calculate faster than the monitor refresh rate
-            desired_maximum_frame_latency: 2,
-            alpha_mode: wgpu::CompositeAlphaMode::Auto,
-            view_formats: vec![wgpu::TextureFormat::Bgra8Unorm],
-            // TODO: 30
-            // color_space: wgpu::SurfaceColorSpace::Auto, 
-        };
-
-        // update() only works when the surface is configured
-        // update() is often called right after new(), and resize() isn't called unless a resize happens, so configuring surface here is necessary
-        surface.configure(&device, &surface_config);
-
-        // group 0 for compute shader: storage texture and accumulation buffer
+        // group 0 layout for compute shader: storage texture and accumulation buffer
         let compute_0_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("Compute bind group 0 layout"),
@@ -250,7 +272,7 @@ impl State {
                 ],
             });
 
-        // group 0 for fragment shader: just storage texture
+        // group 0 layout for fragment shader: just storage texture
         let render_0_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("Render bind group 0 layout"),
@@ -258,8 +280,7 @@ impl State {
                     binding: 0,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
-                        // TextureFormat::Rgba32Float is not filterable, also meaning that a sampler cannot be used
-                        // if sampling is really needed, consider enabling FLOAT32_FILTERABLE feature, which is a native + web feature
+                        // TextureFormat::Rgba32Float is not filterable without FLOAT32_FILTERABLE feature, also meaning that a sampler cannot be used
                         sample_type: wgpu::TextureSampleType::Float { filterable: false },
                         view_dimension: wgpu::TextureViewDimension::D2,
                         multisampled: false,
@@ -268,13 +289,13 @@ impl State {
                 }],
             });
 
-        // group 1 for compute shader: scene data
+        // group 1 layout for compute shader: scene data
         let compute_1_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("Compute bind group 1 layout"),
                 entries: &[
                     wgpu::BindGroupLayoutEntry {
-                        binding: 0, // triangle geometry
+                        binding: 0, // geometries
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Storage { read_only: true },
@@ -284,7 +305,7 @@ impl State {
                         count: None,
                     },
                     wgpu::BindGroupLayoutEntry {
-                        binding: 1, // bvh
+                        binding: 1, // bvh nodes
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Storage { read_only: true },
@@ -294,7 +315,7 @@ impl State {
                         count: None,
                     },
                     wgpu::BindGroupLayoutEntry {
-                        binding: 2, // triangle attributes
+                        binding: 2, // attributes
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Storage { read_only: true },
@@ -364,7 +385,27 @@ impl State {
                         count: None,
                     },
                     wgpu::BindGroupLayoutEntry {
-                        binding: 10, // skybox sampler
+                        binding: 9, // skybox texture
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true }, // feature FLOAT32_FILTERABLE is enabled, so this texture can be filtered
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 10, // skybox luminance
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: std::num::NonZeroU64::new(4),
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 11, // skybox sampler
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                         count: None,
@@ -372,12 +413,128 @@ impl State {
                 ],
             });
 
+        // get bind groups for group 0
+        let (compute_0_bind_group, render_0_bind_group) = Self::create_0_bind_groups(
+            &device,
+            &compute_0_bind_group_layout,
+            &render_0_bind_group_layout,
+            &(surface_config.width, surface_config.height),
+        );
+
+        // before getting bind groups for group 1, we need to load the default scene and skybox first
+        // on both native and wasm, loading files is at runtime, which allows files to change without having to rebuild the WASM
+        let glb_path = format!("assets/glb/{SCENE}");
+        let skybox_path = format!("assets/skybox/{SKYBOX}");
+        #[allow(unused_mut)]
+        let mut glb_bytes;
+        #[allow(unused_mut)]
+        let mut skybox_bytes;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            glb_bytes = std::fs::read(glb_path)?;
+            skybox_bytes = std::fs::read(skybox_path)?;
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            use wasm_bindgen::JsCast; // trait for dyn_into()
+
+            async fn fetch_bytes(url: &str) -> anyhow::Result<Vec<u8>> {
+                let response: web_sys::Response = wasm_bindgen_futures::JsFuture::from(
+                    web_sys::window()
+                        .context("get web_sys window failed")?
+                        .fetch_with_str(url),
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("error fetching {url}: {e:?}"))?
+                .dyn_into()
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "failed to cast resolved fetch response to web_sys::Response: {e:?}"
+                    )
+                })?;
+
+                if !response.ok() {
+                    anyhow::bail!(
+                        "network error: HTTP {} {}",
+                        response.status(),
+                        response.status_text()
+                    );
+                }
+
+                let u8_array = js_sys::Uint8Array::new(
+                    &wasm_bindgen_futures::JsFuture::from(
+                        response
+                            .array_buffer()
+                            .map_err(|e| anyhow::anyhow!("response.array_buffer error: {e:?}"))?,
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("JsFuture::from(array_buffer) error: {e:?}"))?,
+                );
+                let mut bytes = vec![0u8; u8_array.length() as usize];
+                u8_array.copy_to(&mut bytes[..]);
+                Ok(bytes)
+            }
+
+            glb_bytes = fetch_bytes(&glb_path).await?;
+            skybox_bytes = fetch_bytes(&skybox_path).await?;
+        }
+
+        let mut scene = scene::Scene::new(&glb_bytes)?;
+        let mut skybox = scene::Skybox::new(&skybox_bytes)?;
+        skybox.luminance = 8000.0; // the default for this default skybox is too unrealistically low, so modify it here
+
+        scene
+            .camera
+            .translate_and_rotate_to(Some(glam::Vec3::new(0.0, 0.0, 7.0)), None, None);
+
+        // for dragon.glb:
+        // scene.camera.translate_and_rotate_to(Some(glam::Vec3::new(-4.0, 0.2, 0.0)), Some(-90.0_f32.to_radians()), None);
+
+        use wgpu::util::DeviceExt; // for create_buffer_init
+
+        // only the following buffers (and materials_buffer) are stored in the struct since they're the only ones being updated during runtime (note how they have wgpu::BufferUsages::COPY_DST)
+
+        let (gpu_camera, selected_material_index) = scene
+            .takeout_gpu_camera()
+            .context("camera isn't dirty on scene load")?;
+
+        let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Camera"),
+            contents: bytemuck::bytes_of(&gpu_camera),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let skybox_luminance_buffer =
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Skybox luminance"),
+                contents: bytemuck::bytes_of(&skybox.luminance),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            });
+
+        let frame_count_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Frame count"),
+            contents: bytemuck::bytes_of(&1u32),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        // get bind group for group 1
+        let (compute_1_bind_group, materials_buffer) = Self::create_compute_1_bind_group(
+            &device,
+            &queue,
+            &compute_1_bind_group_layout,
+            &scene,
+            &skybox,
+            &camera_buffer,
+            &frame_count_buffer,
+            &skybox_luminance_buffer,
+        );
+
+        // configure compute and render pipelines with the bind group layouts and shader modules
+
         // create a shader module from vertex_fragment.wgsl
         // used for vertex and fragment
         let vertex_fragment_shader =
             device.create_shader_module(wgpu::include_wgsl!("vertex_fragment.wgsl"));
-
-        // configure compute and render pipelines with the bind group layouts and the shader module
 
         let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("Compute pipeline"),
@@ -391,7 +548,7 @@ impl State {
                     immediate_size: 0,
                 }),
             ),
-            module: &device.create_shader_module(wgpu::include_wgsl!("trace_paths.wgsl")), // the compute shader is in a separate file
+            module: &device.create_shader_module(wgpu::include_wgsl!("trace_paths.wgsl")),
             entry_point: Some("compute_main"), // function name in the wgsl file
             compilation_options: Default::default(),
             cache: None,
@@ -440,234 +597,7 @@ impl State {
             cache: None,
         });
 
-        // load and parse a glTF 2.0 file
-        let mut scene = scene::Scene::new(&format!("assets/glb/{GLTF}.glb")).await?;
-        scene
-            .camera
-            .translate_and_rotate_to(Some(glam::Vec3::new(0.0, 0.0, 7.0)), None, None);
-
-        // for dragon.glb:
-        // scene.camera.translate_and_rotate_to(Some(glam::Vec3::new(-4.0, 0.2, 0.0)), Some(-90.0_f32.to_radians()), None);
-
-        // create texture arrays from atlases
-        let texture_atlas_srgb = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("sRGB texture atlas array"),
-            size: wgpu::Extent3d {
-                width: scene::ATLAS_SIZE,
-                height: scene::ATLAS_SIZE,
-                depth_or_array_layers: scene.srgb_texture_atlases.len() as u32,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-
-        let texture_atlas_linear = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("linear texture atlas array"),
-            size: wgpu::Extent3d {
-                width: scene::ATLAS_SIZE,
-                height: scene::ATLAS_SIZE,
-                depth_or_array_layers: scene.linear_texture_atlases.len() as u32,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-
-        // upload each sRGB atlas layer
-        for (layer_idx, atlas_data) in scene.srgb_texture_atlases.iter().enumerate() {
-            queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &texture_atlas_srgb,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d {
-                        x: 0,
-                        y: 0,
-                        z: layer_idx as u32,
-                    },
-                    aspect: wgpu::TextureAspect::All,
-                },
-                atlas_data,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(scene::ATLAS_SIZE * 4),
-                    rows_per_image: Some(scene::ATLAS_SIZE),
-                },
-                wgpu::Extent3d {
-                    width: scene::ATLAS_SIZE,
-                    height: scene::ATLAS_SIZE,
-                    depth_or_array_layers: 1,
-                },
-            );
-        }
-
-        // upload each linear atlas layer
-        for (layer_idx, atlas_data) in scene.linear_texture_atlases.iter().enumerate() {
-            queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &texture_atlas_linear,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d {
-                        x: 0,
-                        y: 0,
-                        z: layer_idx as u32,
-                    },
-                    aspect: wgpu::TextureAspect::All,
-                },
-                atlas_data,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(scene::ATLAS_SIZE * 4),
-                    rows_per_image: Some(scene::ATLAS_SIZE),
-                },
-                wgpu::Extent3d {
-                    width: scene::ATLAS_SIZE,
-                    height: scene::ATLAS_SIZE,
-                    depth_or_array_layers: 1,
-                },
-            );
-        }
-
-        // setup for group 0
-        let (compute_0_bind_group, render_0_bind_group) = Self::create_0_bind_groups(
-            &device,
-            &compute_0_bind_group_layout,
-            &render_0_bind_group_layout,
-            &(surface_config.width, surface_config.height),
-        );
-
-        use wgpu::util::DeviceExt; // for create_buffer_init
-
-        // only camera, frame_count, and material buffers stored in the struct since they're the only ones being updated when the program is running (they have wgpu::BufferUsages::COPY_DST)
-
-        let (gpu_camera, selected_material_index) = scene
-            .takeout_gpu_camera()
-            .context("camera isn't dirty on scene load")?;
-
-        let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Camera"),
-            contents: bytemuck::bytes_of(&gpu_camera),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
-
-        let frame_count_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Frame count"),
-            contents: bytemuck::bytes_of(&1u32),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
-
-        let materials_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Materials"),
-            contents: bytemuck::cast_slice(&scene.materials),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        });
-
-        // local helper function to initialize storage buffers
-        fn create_storage_buffer<T: bytemuck::Pod>(
-            device: &wgpu::Device,
-            label: &str,
-            data: &[T],
-        ) -> wgpu::Buffer {
-            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some(label),
-                contents: bytemuck::cast_slice(data),
-                usage: wgpu::BufferUsages::STORAGE,
-            })
-        }
-
-        let compute_1_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Compute bind group 1"),
-            layout: &compute_1_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: create_storage_buffer(&device, "Geometry", &scene.geometries)
-                        .as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: create_storage_buffer(&device, "BVH", &scene.bvh_nodes)
-                        .as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: create_storage_buffer(&device, "Attributes", &scene.attributes)
-                        .as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: materials_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: wgpu::BindingResource::TextureView(&texture_atlas_srgb.create_view(
-                        &wgpu::TextureViewDescriptor {
-                            label: Some("sRGB texture atlas view"),
-                            format: Some(wgpu::TextureFormat::Rgba8UnormSrgb),
-                            dimension: Some(wgpu::TextureViewDimension::D2Array),
-                            aspect: wgpu::TextureAspect::All,
-                            ..Default::default()
-                        },
-                    )),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: wgpu::BindingResource::TextureView(
-                        &texture_atlas_linear.create_view(&wgpu::TextureViewDescriptor {
-                            label: Some("Linear texture atlas view"),
-                            format: Some(wgpu::TextureFormat::Rgba8Unorm),
-                            dimension: Some(wgpu::TextureViewDimension::D2Array),
-                            aspect: wgpu::TextureAspect::All,
-                            ..Default::default()
-                        }),
-                    ),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 6,
-                    resource: wgpu::BindingResource::Sampler(&device.create_sampler(
-                        &wgpu::SamplerDescriptor {
-                            label: Some("Atlas sampler"),
-                            address_mode_u: wgpu::AddressMode::ClampToEdge,
-                            address_mode_v: wgpu::AddressMode::ClampToEdge,
-                            address_mode_w: wgpu::AddressMode::ClampToEdge,
-                            mag_filter: wgpu::FilterMode::Nearest,
-                            min_filter: wgpu::FilterMode::Nearest,
-                            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
-                            ..Default::default()
-                        },
-                    )),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 7,
-                    resource: camera_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 8,
-                    resource: frame_count_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 10,
-                    resource: wgpu::BindingResource::Sampler(&device.create_sampler(
-                        &wgpu::SamplerDescriptor {
-                            label: Some("Skybox sampler"),
-                            address_mode_u: wgpu::AddressMode::ClampToEdge,
-                            address_mode_v: wgpu::AddressMode::ClampToEdge,
-                            address_mode_w: wgpu::AddressMode::ClampToEdge,
-                            mag_filter: wgpu::FilterMode::Linear,
-                            min_filter: wgpu::FilterMode::Linear,
-                            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
-                            ..Default::default()
-                        },
-                    )),
-                },
-            ],
-        });
+        let (file_sender, file_receiver) = std::sync::mpsc::channel();
 
         Ok(Self {
             surface,
@@ -681,14 +611,18 @@ impl State {
             render_0_bind_group_layout,
 
             compute_1_bind_group,
+            compute_1_bind_group_layout,
+
             camera_buffer,
             frame_count_buffer,
+            skybox_luminance_buffer,
             materials_buffer,
 
             compute_pipeline,
             render_pipeline,
 
             scene,
+            skybox,
 
             user_mode: UserMode::CursorFree,
 
@@ -709,6 +643,10 @@ impl State {
 
             #[cfg(all(feature = "testing", not(target_arch = "wasm32")))]
             profiler,
+
+            file_receiver,
+            file_sender,
+            file_upload_status: String::new(),
 
             window,
         })
@@ -785,6 +723,306 @@ impl State {
         )
     }
 
+    /// Create or recreate the scene data including textures and their corresponding bind groups for the compute pipeline.
+    /// Called on new scene or skybox upload.
+    /// Returns the compute bind group and materials buffer, respectively, as a tuple.
+    fn create_compute_1_bind_group(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        layout: &wgpu::BindGroupLayout,
+        scene: &scene::Scene,
+        skybox: &scene::Skybox,
+        camera_buffer: &wgpu::Buffer,
+        frame_count_buffer: &wgpu::Buffer,
+        skybox_luminance_buffer: &wgpu::Buffer,
+    ) -> (wgpu::BindGroup, wgpu::Buffer) {
+        // handle the textures first
+
+        // handle skybox texture
+        let skybox_texture_size = wgpu::Extent3d {
+            width: skybox.width,
+            height: skybox.height,
+            depth_or_array_layers: 1,
+        };
+        let skybox_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Skybox texture"),
+            size: skybox_texture_size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2, // 2D equirectangular
+            format: wgpu::TextureFormat::Rgba32Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &skybox_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            bytemuck::cast_slice(&skybox.rgba),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(skybox.width * 16), // 4 channels * 4 bytes (f32)
+                rows_per_image: Some(skybox.height),
+            },
+            skybox_texture_size,
+        );
+
+        // handle texture atlases
+        let srgb_texture_atlas = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("sRGB texture atlas array"),
+            size: wgpu::Extent3d {
+                width: scene::ATLAS_SIZE,
+                height: scene::ATLAS_SIZE,
+                depth_or_array_layers: scene.srgb_texture_atlases.len() as u32,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let linear_texture_atlas = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Linear texture atlas array"),
+            size: wgpu::Extent3d {
+                width: scene::ATLAS_SIZE,
+                height: scene::ATLAS_SIZE,
+                depth_or_array_layers: scene.linear_texture_atlases.len() as u32,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+
+        // upload each sRGB atlas layer
+        for (layer_idx, atlas_data) in scene.srgb_texture_atlases.iter().enumerate() {
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &srgb_texture_atlas,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: 0,
+                        y: 0,
+                        z: layer_idx as u32,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                atlas_data,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(scene::ATLAS_SIZE * 4),
+                    rows_per_image: Some(scene::ATLAS_SIZE),
+                },
+                wgpu::Extent3d {
+                    width: scene::ATLAS_SIZE,
+                    height: scene::ATLAS_SIZE,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+        // upload each linear atlas layer
+        for (layer_idx, atlas_data) in scene.linear_texture_atlases.iter().enumerate() {
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &linear_texture_atlas,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: 0,
+                        y: 0,
+                        z: layer_idx as u32,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                atlas_data,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(scene::ATLAS_SIZE * 4),
+                    rows_per_image: Some(scene::ATLAS_SIZE),
+                },
+                wgpu::Extent3d {
+                    width: scene::ATLAS_SIZE,
+                    height: scene::ATLAS_SIZE,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+
+        use wgpu::util::DeviceExt;
+
+        let materials_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Materials"),
+            contents: bytemuck::cast_slice(&scene.materials),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+
+        // local helper function to initialize storage buffers
+        fn create_storage_buffer<T: bytemuck::Pod>(
+            device: &wgpu::Device,
+            label: &str,
+            data: &[T],
+        ) -> wgpu::Buffer {
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(label),
+                contents: bytemuck::cast_slice(data),
+                usage: wgpu::BufferUsages::STORAGE,
+            })
+        }
+
+        let compute_1_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Compute bind group 1"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: create_storage_buffer(device, "Geometries", &scene.geometries)
+                        .as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: create_storage_buffer(device, "BVH nodes", &scene.bvh_nodes)
+                        .as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: create_storage_buffer(device, "Attributes", &scene.attributes)
+                        .as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: materials_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(&srgb_texture_atlas.create_view(
+                        &wgpu::TextureViewDescriptor {
+                            label: Some("sRGB texture atlas view"),
+                            format: Some(wgpu::TextureFormat::Rgba8UnormSrgb),
+                            dimension: Some(wgpu::TextureViewDimension::D2Array),
+                            aspect: wgpu::TextureAspect::All,
+                            ..Default::default()
+                        },
+                    )),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(
+                        &linear_texture_atlas.create_view(&wgpu::TextureViewDescriptor {
+                            label: Some("Linear texture atlas view"),
+                            format: Some(wgpu::TextureFormat::Rgba8Unorm),
+                            dimension: Some(wgpu::TextureViewDimension::D2Array),
+                            aspect: wgpu::TextureAspect::All,
+                            ..Default::default()
+                        }),
+                    ),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::Sampler(&device.create_sampler(
+                        &wgpu::SamplerDescriptor {
+                            label: Some("Atlas sampler"),
+                            address_mode_u: wgpu::AddressMode::ClampToEdge,
+                            address_mode_v: wgpu::AddressMode::ClampToEdge,
+                            address_mode_w: wgpu::AddressMode::ClampToEdge,
+                            mag_filter: wgpu::FilterMode::Nearest,
+                            min_filter: wgpu::FilterMode::Nearest,
+                            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+                            ..Default::default()
+                        },
+                    )),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: camera_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: frame_count_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: wgpu::BindingResource::TextureView(&skybox_texture.create_view(
+                        &wgpu::TextureViewDescriptor {
+                            label: Some("Skybox texture view"),
+                            format: Some(wgpu::TextureFormat::Rgba32Float),
+                            dimension: Some(wgpu::TextureViewDimension::D2),
+                            aspect: wgpu::TextureAspect::All,
+                            ..Default::default()
+                        },
+                    )),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 10,
+                    resource: skybox_luminance_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 11,
+                    resource: wgpu::BindingResource::Sampler(&device.create_sampler(
+                        &wgpu::SamplerDescriptor {
+                            label: Some("Skybox sampler"),
+                            address_mode_u: wgpu::AddressMode::ClampToEdge,
+                            address_mode_v: wgpu::AddressMode::ClampToEdge,
+                            address_mode_w: wgpu::AddressMode::ClampToEdge,
+                            mag_filter: wgpu::FilterMode::Linear,
+                            min_filter: wgpu::FilterMode::Linear,
+                            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+                            ..Default::default()
+                        },
+                    )),
+                },
+            ],
+        });
+
+        (compute_1_bind_group, materials_buffer)
+    }
+
+    /// Use [`rfd`] to allow file picking on both native and web.
+    ///
+    /// `is_scene` being `true` means picking a scene, `false` means picking a skybox.
+    // called only in update()
+    fn spawn_file_picker(file_sender: std::sync::mpsc::Sender<UploadedFile>, is_scene: bool) {
+        #[cfg(not(target_arch = "wasm32"))]
+        std::thread::spawn(move || {
+            let mut dialog = rfd::FileDialog::new();
+            if is_scene {
+                dialog = dialog.add_filter("Scene", &["glb"]);
+            } else {
+                dialog = dialog.add_filter("Skybox", &["hdr", "exr"]);
+            }
+            if let Some(path) = dialog.pick_file()
+                && let Ok(bytes) = std::fs::read(path)
+            {
+                let _ = file_sender.send(if is_scene {
+                    UploadedFile::Scene(bytes)
+                } else {
+                    UploadedFile::Skybox(bytes)
+                });
+            }
+        });
+        #[cfg(target_arch = "wasm32")]
+        wasm_bindgen_futures::spawn_local(async move {
+            let mut dialog = rfd::AsyncFileDialog::new();
+            if is_scene {
+                dialog = dialog.add_filter("Scene", &["glb"]);
+            } else {
+                dialog = dialog.add_filter("Skybox", &["hdr", "exr"]);
+            }
+            if let Some(file) = dialog.pick_file().await {
+                let bytes = file.read().await;
+                let _ = file_sender.send(if is_scene {
+                    UploadedFile::Scene(bytes)
+                } else {
+                    UploadedFile::Skybox(bytes)
+                });
+            }
+        });
+    }
+
     /// Handle window resizes by reconfiguring the surface,
     /// recreating the storage texture and accumulation buffer,
     /// recreating their bind groups [`State::compute_0_bind_group`] and [`State::render_0_bind_group`],
@@ -813,11 +1051,6 @@ impl State {
         }
     }
 
-    /// Returns whether the cursor is currently grabbed by the application.
-    pub(crate) const fn is_cursor_grabbed(&self) -> bool {
-        matches!(self.user_mode, UserMode::CursorGrabbed(_))
-    }
-
     /// Called every frame in a loop to update the application state and perform rendering.
     pub(crate) fn update(&mut self) {
         match self.surface.get_current_texture() {
@@ -825,32 +1058,158 @@ impl State {
                 let dt = self.last_instant.elapsed().as_secs_f32();
                 self.last_instant = web_time::Instant::now();
 
-                let mut ui_changed_mat_index = None;
+                let raw_input = self.egui_winit_state.take_egui_input(&self.window);
 
-                let mut full_output = self.egui_context.run_ui(
-                    self.egui_winit_state.take_egui_input(&self.window),
-                    |root_ui| {
-                        if self.show_ui {
-                            ui_changed_mat_index = ui::run(
-                                root_ui,
-                                &mut self.scene,
-                                self.selected_material_index,
-                                dt,
-                                self.frame_count,
-                            );
+                // allow the user to drag and drop a scene or skybox
+                // TODO: doesn't work on wasm32 at all, even when browser default drag and drop behavior is disabled; probably requires complex fix
+                let mut dropped_glb = None;
+                let mut dropped_skybox = None;
+
+                for file in &raw_input.dropped_files {
+                    if let Some(bytes) = &file.bytes {
+                        if std::path::Path::new(&file.name)
+                            .extension()
+                            .is_some_and(|ext| ext.eq_ignore_ascii_case("glb"))
+                        {
+                            dropped_glb = Some(bytes.to_vec());
+                        } else if std::path::Path::new(&file.name)
+                            .extension()
+                            .is_some_and(|ext| ext.eq_ignore_ascii_case("exr"))
+                            || std::path::Path::new(&file.name)
+                                .extension()
+                                .is_some_and(|ext| ext.eq_ignore_ascii_case("hdr"))
+                        {
+                            dropped_skybox = Some(bytes.to_vec());
                         }
-                    },
-                );
+                    } else if let Some(path) = &file.path
+                        && let Some(ext) = path.extension().and_then(|e| e.to_str())
+                    {
+                        let ext_lower = ext.to_lowercase();
 
-                if let Some(mat_index) = ui_changed_mat_index {
-                    self.queue.write_buffer(
-                        &self.materials_buffer,
-                        (mat_index * std::mem::size_of::<scene::GpuMaterial>())
-                            as wgpu::BufferAddress,
-                        bytemuck::bytes_of(&self.scene.materials[mat_index]),
-                    );
+                        if ext_lower == "glb"
+                            && let Ok(bytes) = std::fs::read(path)
+                        {
+                            dropped_glb = Some(bytes);
+                        } else if (ext_lower == "exr" || ext_lower == "hdr")
+                            && let Ok(bytes) = std::fs::read(path)
+                        {
+                            dropped_skybox = Some(bytes);
+                        }
+                    }
+                }
 
-                    self.frame_count = 0;
+                if let Some(bytes) = dropped_glb {
+                    // note that updating self.file_upload_status here is redundant since only one file_upload_status can be shown per frame (each frame is an entire execution of update()),
+                    // and while dropping a file and loading it (see self.file_receiver.try_recv() below) happens in this same frame, self.file_upload_status is overridden later on
+                    let _ = self.file_sender.send(UploadedFile::Scene(bytes));
+                }
+                if let Some(bytes) = dropped_skybox {
+                    let _ = self.file_sender.send(UploadedFile::Skybox(bytes));
+                }
+
+                let is_hovering = !raw_input.hovered_files.is_empty();
+                let mut full_output = self.egui_context.run_ui(raw_input, |root_ui| {
+                    if self.show_ui {
+                        for action in ui::run_base(
+                            root_ui,
+                            &mut self.scene,
+                            &mut self.skybox,
+                            dt,
+                            self.frame_count,
+                            &self.file_upload_status,
+                            is_hovering,
+                        ) {
+                            match action {
+                                ui::BaseUiAction::UploadScene => {
+                                    self.file_upload_status = "Picking scene...".to_string();
+                                    Self::spawn_file_picker(self.file_sender.clone(), true);
+                                }
+                                ui::BaseUiAction::UploadSkybox => {
+                                    self.file_upload_status = "Picking skybox...".to_string();
+                                    Self::spawn_file_picker(self.file_sender.clone(), false);
+                                }
+                                ui::BaseUiAction::UpdateSkyboxLuminance => {
+                                    self.queue.write_buffer(
+                                        &self.skybox_luminance_buffer,
+                                        0,
+                                        bytemuck::bytes_of(&self.skybox.luminance),
+                                    );
+                                    self.frame_count = 0;
+                                }
+                            }
+                        }
+
+                        if let Some(material_index) = self.selected_material_index
+                            && ui::run_modify_material(root_ui, &mut self.scene, material_index)
+                        {
+                            self.queue.write_buffer(
+                                &self.materials_buffer,
+                                (material_index * std::mem::size_of::<scene::GpuMaterial>())
+                                    as wgpu::BufferAddress,
+                                bytemuck::bytes_of(&self.scene.materials[material_index]),
+                            );
+
+                            self.frame_count = 0;
+                        }
+                    }
+                });
+
+                // handle when a file is uploaded
+                // TODO: this makes the entire app freeze if the scene or skybox is large; maybe do this on a background thread somehow?
+                while let Ok(file) = self.file_receiver.try_recv() {
+                    match file {
+                        UploadedFile::Scene(bytes) => {
+                            if let Ok(new_scene) = scene::Scene::new(&bytes) {
+                                self.scene = new_scene;
+                                let (compute_1_bind_group, materials_buffer) =
+                                    Self::create_compute_1_bind_group(
+                                        &self.device,
+                                        &self.queue,
+                                        &self.compute_1_bind_group_layout,
+                                        &self.scene,
+                                        &self.skybox,
+                                        &self.camera_buffer,
+                                        &self.frame_count_buffer,
+                                        &self.skybox_luminance_buffer,
+                                    );
+                                self.materials_buffer = materials_buffer;
+                                self.compute_1_bind_group = compute_1_bind_group;
+                                self.frame_count = 0;
+                                self.scene.camera.resize(
+                                    (self.surface_config.width as f32)
+                                        / (self.surface_config.height as f32),
+                                ); // needed since scene::new() creates a camera with aspect ratio 1.0
+                                self.file_upload_status = "Successfully loaded scene".to_string();
+                            } else {
+                                log::warn!("Failed to load scene");
+                                self.file_upload_status = "Failed to load scene".to_string();
+                            }
+                        }
+                        UploadedFile::Skybox(bytes) => {
+                            if let Ok(mut new_skybox) = scene::Skybox::new(&bytes) {
+                                new_skybox.luminance = self.skybox.luminance; // the luminance can be carried over
+                                self.skybox = new_skybox;
+                                let (compute_1_bind_group, materials_buffer) =
+                                    Self::create_compute_1_bind_group(
+                                        &self.device,
+                                        &self.queue,
+                                        &self.compute_1_bind_group_layout,
+                                        &self.scene,
+                                        &self.skybox,
+                                        &self.camera_buffer,
+                                        &self.frame_count_buffer,
+                                        &self.skybox_luminance_buffer,
+                                    );
+                                self.materials_buffer = materials_buffer;
+                                self.compute_1_bind_group = compute_1_bind_group;
+                                self.frame_count = 0;
+                                self.file_upload_status = "Successfully loaded skybox".to_string();
+                            } else {
+                                log::warn!("Failed to load skybox");
+                                self.file_upload_status = "Failed to load skybox".to_string();
+                            }
+                        }
+                    }
                 }
 
                 match &self.user_mode {
@@ -860,6 +1219,9 @@ impl State {
                     UserMode::CursorFree => {}
                 }
 
+                // this takeout_gpu_camera is called here because it updates self.selected_material_index according to the current self.scene
+                // self.selected_material_index must be updated after self.scene changes, before ui::run_modify_material(),
+                // because if the user uploads a new .glb file and scene.materials change, indexing inside ui::run_modify_material() with an outdated selected_material_index can cause index out of bounds
                 if let Some((gpu_camera, selected_material_index)) = self.scene.takeout_gpu_camera()
                 {
                     self.selected_material_index = selected_material_index;
@@ -1062,7 +1424,7 @@ impl State {
                 self.window.pre_present_notify();
 
                 frame.present();
-                // TODO: 30 
+                // TODO: 30
                 // self.queue.present(frame);
 
                 // the first proper frame is presented, so there is something on the canvas on the web,
@@ -1165,6 +1527,11 @@ impl State {
                 self.window.set_cursor_visible(false);
             }
         }
+    }
+
+    /// Returns whether the cursor is currently grabbed by the application.
+    pub(crate) const fn is_cursor_grabbed(&self) -> bool {
+        matches!(self.user_mode, UserMode::CursorGrabbed(_))
     }
 
     /// Release the cursor from the window, setting cursor grab mode to none.

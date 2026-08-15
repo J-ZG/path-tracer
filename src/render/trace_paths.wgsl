@@ -2,6 +2,7 @@
 
 const PI = 3.14159265359;
 const INV_PI = 0.31830988618;
+const INV_2PI = 0.15915494309189535;
 
 const LUMA_COEFFICIENTS = vec3f(0.2126, 0.7152, 0.0722); // standard Rec. 709 coefficients to convert RGB -> luminance value
 
@@ -21,7 +22,7 @@ const LUMA_COEFFICIENTS = vec3f(0.2126, 0.7152, 0.0722); // standard Rec. 709 co
 // EXPOSURE = 1 / max_luminance ≈ 0.00002604166
 // also, EXPOSURE = 0.001 can come from approximately aperture 4, shutter speed 1/50, iso 100; typical for indoor scenes
 const EXPOSURE = 0.00002604166;
-// TODO: implement and allow the user to adjust (can be stored in GpuCamera struct):
+// TODO: implement and allow the user to adjust (can be stored in Camera struct):
 // - aperture: enables depth of field
 // - shutter speed: needed for calculating EXPOSURE assuming ISO is 100, also implement auto exposure
 // - focus distance: also implement auto focus
@@ -29,7 +30,7 @@ const EXPOSURE = 0.00002604166;
 // - focal length: together with sensor width determines FOV (get rid of just the FOV slider)
 // - optionally aperture blades: defines the look of bokeh
 
-// TODO 4: implement tracing shadow rays for better denoising (NEE), then combine everything with MIS; eventually, look into ReSTIR or something
+// TODO: implement tracing shadow rays for better denoising (NEE), then combine everything with MIS; eventually, look into ReSTIR or something
 // TODO: look into possibly making a branched path tracer
 // TODO: look into spectral rendering
 
@@ -37,12 +38,12 @@ const EXPOSURE = 0.00002604166;
 
 // to go from the debug YAML to Blender: negate Z, then swap Z and Y
 
-// these structs match with Rust side definitions
+// these structs match with Rust side definitions (struct names have Gpu- prefix removed)
 // see Rust code for more detailed documentation
 
-// GpuTriangleGeometry and GpuTriangleAttribute are separate structs just because the shader fetches vertices much more frequently than normals
+// TriangleGeometry and TriangleAttribute are separate structs just because the shader fetches vertices much more frequently than normals
 // although, actual benchmarks show that the performance difference is negligible, so they could be combined into one struct, but would require more padding, so they're kept separate for now
-struct GpuTriangleGeometry {
+struct TriangleGeometry {
     coords: array<f32, 9>, // 3 vertices with x, y, z for each vertex
     // stored as a flat array since vec3<T> has alignment of 16 bytes, which misaligns with Rust's glam::Vec3 which has alignment of 12 bytes
     // using a flat array allows packing the vertex data without padding
@@ -51,9 +52,9 @@ struct GpuTriangleGeometry {
     // should be optimized by the compiler and not cause a performance difference
     // benchmarks show that using a flat array vs vec3 doesn't cause a performance difference
 };
-struct GpuTriangleAttribute {
-    index: u32, // index into materials for the GpuMaterial this triangle uses
-    normals: array<f32, 9>, // same packing logic as GpuTriangleGeometry for the normals of the 3 vertices
+struct TriangleAttribute {
+    index: u32, // index into materials for the Material this triangle uses
+    normals: array<f32, 9>, // same packing logic as TriangleGeometry for the normals of the 3 vertices
     uv0: vec2f,
     uv1: vec2f,
     uv2: vec2f,
@@ -70,7 +71,7 @@ struct BvhNode {
 }
 
 // field names here follow OpenPBR
-struct GpuMaterial {
+struct Material {
     base_color: vec4f, // OpenPBR uses only RGB, not A
     base_weight: f32,
     base_metalness: f32,
@@ -100,7 +101,7 @@ struct GpuMaterial {
     specular_weight_uv: vec4f,
 };
 
-struct GpuCamera {
+struct Camera {
     position: vec4f,
     lower_left_corner_minus_position: vec4f,
     horizontal: vec4f,
@@ -109,17 +110,18 @@ struct GpuCamera {
 
 @group(0) @binding(0) var screen: texture_storage_2d<rgba32float, write>;
 @group(0) @binding(1) var<storage, read_write> accumulation_buffer: array<vec4f>; // this is actually used as a texture, but since textures cannot be both read and write, a storage buffer is used instead
-@group(1) @binding(0) var<storage, read> triangles_geo: array<GpuTriangleGeometry>;
+@group(1) @binding(0) var<storage, read> geometries: array<TriangleGeometry>;
 @group(1) @binding(1) var<storage, read> bvh_nodes: array<BvhNode>;
-@group(1) @binding(2) var<storage, read> triangles_attr: array<GpuTriangleAttribute>;
-@group(1) @binding(3) var<storage, read> materials: array<GpuMaterial>;
+@group(1) @binding(2) var<storage, read> attributes: array<TriangleAttribute>;
+@group(1) @binding(3) var<storage, read> materials: array<Material>;
 @group(1) @binding(4) var srgb_texture_atlas: texture_2d_array<f32>;
 @group(1) @binding(5) var linear_texture_atlas: texture_2d_array<f32>;
 @group(1) @binding(6) var atlas_sampler: sampler;
-@group(1) @binding(7) var<uniform> camera: GpuCamera;
+@group(1) @binding(7) var<uniform> camera: Camera;
 @group(1) @binding(8) var<uniform> frame_count: u32;
-@group(1) @binding(9) var skybox_texture: texture_cube<f32>; // TODO finish implementing skybox
-@group(1) @binding(10) var skybox_sampler: sampler;
+@group(1) @binding(9) var skybox_texture: texture_2d<f32>;
+@group(1) @binding(10) var<uniform> skybox_luminance: f32;
+@group(1) @binding(11) var skybox_sampler: sampler;
 
 struct Ray {
     origin: vec3f, // camera origin position in world space
@@ -300,7 +302,7 @@ fn compute_main(@builtin(global_invocation_id) global_id: vec3u) {
     for (var bounce = 0u; bounce < 10u; bounce += 1u) { // russian roulette is implemented, so this can be large
         var closest_t = 0x1.fffffep+127f; // max float value IEEE-754 binary32; how far along the ray the intersection with a triangle is
         // specifically, we use f(x) = m * x + b to find the exact coordinates of the intersection, where m is the ray direction, x is this closest_t, and b is the ray origin
-        var hit_index = -1; // if the ray intersects with a triangle, this is that triangle's index in triangles_geo
+        var hit_index = -1; // if the ray intersects with a triangle, this is that triangle's index in geometries
         var hit_v = 0.0; // barycentric coordinates of the ray-triangle intersection
         var hit_w = 0.0;
 
@@ -358,7 +360,7 @@ fn compute_main(@builtin(global_invocation_id) global_id: vec3u) {
             if node.tri_count > 0u { // leaf node; intersect with triangles
                 for (var i = 0u; i < node.tri_count; i += 1u) {
                     let tri_index = node.left_first + i;
-                    let tri = triangles_geo[tri_index];
+                    let tri = geometries[tri_index];
 
                     let p0 = vec3f(tri.coords[0], tri.coords[1], tri.coords[2]);
                     let p1 = vec3f(tri.coords[3], tri.coords[4], tri.coords[5]);
@@ -416,13 +418,6 @@ fn compute_main(@builtin(global_invocation_id) global_id: vec3u) {
 
         // ray escaped the scene, render sky color and terminate
         if hit_index == -1 {
-            // TODO 3: allow user to input skybox with nits
-
-            // normal clear sky at 8000 nits (should be paired with EXPOSURE from Sunny 16), calculated like so:
-            // raw_sky_color = vec3f(0.4, 0.6, 1.0), and target_nits = 8000
-            // sky_color = (raw_sky_color / dot(raw_sky_color, LUMA_COEFFICIENTS)) * target_nits
-            let sky_color = vec3f(5457.4, 8186.1, 13643.5);
-
             // black sky
             // let sky_color = vec3f(0.0);
 
@@ -448,11 +443,23 @@ fn compute_main(@builtin(global_invocation_id) global_id: vec3u) {
             //     sky_color = (raw_sky_color / luma) * 8000.0;
             // }
 
-            final_color += throughput * sky_color;
+            // normal clear sky at 8000 nits (should be paired with EXPOSURE from Sunny 16), calculated like so:
+            // raw_sky_color = vec3f(0.4, 0.6, 1.0), and target_nits = 8000
+            // sky_color = (raw_sky_color / dot(raw_sky_color, LUMA_COEFFICIENTS)) * target_nits
+            // let sky_color = vec3f(5457.4, 8186.1, 13643.5);
+
+            // use skybox texture
+
+            let u = fma(atan2(ray.direction.z, ray.direction.x), INV_2PI, 0.5);
+            let v = fma(-asin(ray.direction.y), INV_PI, 0.5);
+
+            let sky_color = textureSampleLevel(skybox_texture, skybox_sampler, vec2f(u, v), 0.0).rgb;
+
+            final_color += throughput * sky_color * skybox_luminance;
             break; // terminate this ray; this pixel's final color is now determined
         }
 
-        let attr = triangles_attr[u32(hit_index)];
+        let attr = attributes[u32(hit_index)];
         let mat = materials[attr.index];
 
         // only 2 barycentric coordinates are given, but we know that the point is valid inside the triangle so all coordinates must sum to 1
@@ -533,8 +540,8 @@ fn compute_main(@builtin(global_invocation_id) global_id: vec3u) {
 
         let V = -ray.direction; // view vector, going from the surface to the camera expressed in world space
 
-        // flat normals can be precomputed and passed to the shader in GpuTriangleAttribute, but this calculation seems simple, so precomputation probably isn't better
-        let tri = triangles_geo[u32(hit_index)];
+        // flat normals can be precomputed and passed to the shader in TriangleAttribute, but this calculation seems simple, so precomputation probably isn't better
+        let tri = geometries[u32(hit_index)];
         let p0 = vec3f(tri.coords[0], tri.coords[1], tri.coords[2]);
         let p1 = vec3f(tri.coords[3], tri.coords[4], tri.coords[5]);
         let p2 = vec3f(tri.coords[6], tri.coords[7], tri.coords[8]);
@@ -580,7 +587,7 @@ fn compute_main(@builtin(global_invocation_id) global_id: vec3u) {
             // https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html#_material_normaltextureinfo_scale
             var local_n = normal_tex.rgb * 2.0 - 1.0; // in WGSL, vec minus scalar works component-wise as intended; see https://www.w3.org/TR/WGSL/#arithmetic-expr
 
-            // per glTF, normal textures should have blue values in (0.5, 1.0]
+            // per glTF spec, normal textures should have blue values in (0.5, 1.0]
             // hence, local_n.z should be >0, so the normalize below is safe
             local_n = normalize(vec3f(local_n.xy * mat.normal_scale, local_n.z));
 

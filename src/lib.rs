@@ -164,13 +164,18 @@ impl winit::application::ApplicationHandler<State> for App {
         };
 
         // let egui consume events only when the cursor isn't grabbed
-        if !state.is_cursor_grabbed()
-            && state
+        if !state.is_cursor_grabbed() {
+            let egui_response = state
                 .egui_winit_state
-                .on_window_event(&state.window, &event)
-                .consumed
-        {
-            return;
+                .on_window_event(&state.window, &event);
+            if egui_response.repaint {
+                // only needed when user uploads a file, since RedrawRequested can be swallowed for some reason after file upload,
+                // breaking the loop calling state.update()
+                state.window.request_redraw();
+            }
+            if egui_response.consumed {
+                return;
+            }
         }
 
         match event {
