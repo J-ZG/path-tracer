@@ -4,7 +4,6 @@ cw = "clippy --target wasm32-unknown-unknown --all-targets" # no --all-features 
 rr = "run --release"
 t = "run --features testing"
 
-[build]
-rustflags = ["--cfg=web_sys_unstable_apis"]
-# can add ["-W", "unused-crate-dependencies"], but will generate false positives: 
+# [build]
+# can add rustflags = ["-W", "unused-crate-dependencies"], but will generate false positives: 
 # https://github.com/rust-lang/rust/issues/95513

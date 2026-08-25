@@ -158,6 +158,28 @@ fn rand() -> f32 {
     return bitcast<f32>(0x3f800000u | bits) - 1.0;
 }
 
+// ray-aabb intersection during BVH traversal
+// returns the distance from ray_origin to the intersection (0.0 if already inside aabb), or -1.0 if missed
+// slab method
+fn intersect_aabb(node: BvhNode, ray_origin: vec3<f32>, inv_dir: vec3<f32>, closest_t: f32) -> f32 {
+    let t0 = (node.aabb_min - ray_origin) * inv_dir;
+    let t1 = (node.aabb_max - ray_origin) * inv_dir;
+
+    let tmin = min(t0, t1);
+    let tmax = max(t0, t1);
+
+    let t_near = max(max(tmin.x, tmin.y), tmin.z);
+    let t_far = min(min(tmax.x, tmax.y), tmax.z);
+
+    // if the ray hits the aabb and it's closer than closest_t
+    if t_near <= t_far && t_far > 0.0 && t_near < closest_t {
+        // max(0.0, t_near) ensures that if the camera is inside the AABB, returns distance 0 instead of a negative value
+        return max(0.0, t_near);
+    }
+
+    return -1.0; // missed
+}
+
 // exact Fresnel
 // https://en.wikipedia.org/wiki/Fresnel_equations#Power_(intensity)_reflection_and_transmission_coefficients
 // to approximate exact Fresnel to improve speed, use improved Schlick's approximation: https://www.photometric.io/blog/improving-schlicks-approximation/
@@ -328,11 +350,11 @@ fn compute_main(@builtin(global_invocation_id) global_id: vec3u) {
         let Sy = -ray.direction[ky] * Sz;
 
         // setup fixed-size stack for BVH traversal (depth 64 is sufficient for millions of triangles)
-        var stack: array<u32, 64>;
+        var stack: array<u32, 64>; // TODO: investigate if 64 can be set dynamically
         var stack_ptr = 0u;
 
         // push root node
-        stack[stack_ptr] = 0u;
+        stack[0] = 0u;
         stack_ptr += 1u;
 
         // BVH traversal
@@ -341,23 +363,8 @@ fn compute_main(@builtin(global_invocation_id) global_id: vec3u) {
             stack_ptr -= 1u;
             let node = bvh_nodes[stack[stack_ptr]];
 
-            // ray-AABB intersection (slab method)
-
-            let t0 = (node.aabb_min - ray.origin) * ray.direction_reciprocal;
-            let t1 = (node.aabb_max - ray.origin) * ray.direction_reciprocal;
-
-            let tmin = min(t0, t1);
-            let tmax = max(t0, t1);
-
-            let t_near = max(max(tmin.x, tmin.y), tmin.z);
-            let t_far = min(min(tmax.x, tmax.y), tmax.z);
-
-            // if ray misses the bounding box or is further than the closest hit, skip it
-            if !(t_near <= t_far && t_far > 0.0 && t_near < closest_t) {
-                continue;
-            }
-
-            if node.tri_count > 0u { // leaf node; intersect with triangles
+            if node.tri_count > 0u {
+                // leaf node: intersect with triangles
                 for (var i = 0u; i < node.tri_count; i += 1u) {
                     let tri_index = node.left_first + i;
                     let tri = geometries[tri_index];
@@ -406,13 +413,36 @@ fn compute_main(@builtin(global_invocation_id) global_id: vec3u) {
                         hit_w = W * inv_det;
                     }
                 }
-            } else { // internal node; push children onto stack
-                // left_first contains the index of the left child; right child is contiguous at left_first + 1
-                // TODO: push farther child first
-                stack[stack_ptr] = node.left_first + 1; // push right
-                stack_ptr += 1;
-                stack[stack_ptr] = node.left_first; // push left
-                stack_ptr += 1;
+            } else {
+                // internal node: test both children's aabb and push children accordingly
+
+                let left_index = node.left_first;
+                let right_index = node.left_first + 1u;
+
+                let dist_left = intersect_aabb(bvh_nodes[left_index], ray.origin, ray.direction_reciprocal, closest_t);
+                let dist_right = intersect_aabb(bvh_nodes[right_index], ray.origin, ray.direction_reciprocal, closest_t);
+
+                let hit_left = dist_left >= 0.0;
+                let hit_right = dist_right >= 0.0;
+
+                if hit_left && hit_right {
+                    // both children nodes are hit
+                    // push the further node first, so the closer node is popped first
+                    if dist_left < dist_right {
+                        stack[stack_ptr] = right_index;
+                        stack[stack_ptr + 1u] = left_index;
+                    } else {
+                        stack[stack_ptr] = left_index;
+                        stack[stack_ptr + 1u] = right_index;
+                    }
+                    stack_ptr += 2u;
+                } else if hit_left {
+                    stack[stack_ptr] = left_index;
+                    stack_ptr += 1u;
+                } else if hit_right {
+                    stack[stack_ptr] = right_index;
+                    stack_ptr += 1u;
+                }
             }
         }
 

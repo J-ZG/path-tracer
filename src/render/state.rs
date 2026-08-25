@@ -11,7 +11,7 @@
 const SCENE: &str = "box.glb";
 
 /// The name of the skybox hdr or exr file to load from the [`assets/skybox/`](https://github.com/0dpe/path-tracer/tree/main/assets/skybox) directory to render by default.
-const SKYBOX: &str = "kloppenheim_06_puresky_4k.exr"; // https://polyhaven.com/a/kloppenheim_06_puresky
+const SKYBOX: &str = "kloppenheim_06_puresky_2k.hdr"; // https://polyhaven.com/a/kloppenheim_06_puresky
 
 use anyhow::Context;
 
@@ -193,6 +193,7 @@ impl State {
         // see which TextureFormat's are supported by the surface
         // Bgra8Unorm and Bgra8UnormSrgb should be guaranteed, but on web, Bgra8UnormSrgb isn't supported it seems
         // for example, on Windows native, [Bgra8UnormSrgb, Rgba8UnormSrgb, Bgra8Unorm, Rgba8Unorm, Rgba16Float, Rgb10a2Unorm] are supported, but with Chrome or Firefox, only [Bgra8Unorm, Rgba8Unorm, Rgba16Float] are supported
+        #[cfg(all(feature = "testing", not(target_arch = "wasm32")))]
         log::info!(
             "Surface formats: {:?}",
             surface.get_capabilities(&adapter).formats
@@ -482,13 +483,6 @@ impl State {
         let mut scene = scene::Scene::new(&glb_bytes)?;
         let mut skybox = scene::Skybox::new(&skybox_bytes)?;
         skybox.luminance = 8000.0; // the default for this default skybox is too unrealistically low, so modify it here
-
-        scene
-            .camera
-            .translate_and_rotate_to(Some(glam::Vec3::new(0.0, 0.0, 7.0)), None, None);
-
-        // for dragon.glb:
-        // scene.camera.translate_and_rotate_to(Some(glam::Vec3::new(-4.0, 0.2, 0.0)), Some(-90.0_f32.to_radians()), None);
 
         use wgpu::util::DeviceExt; // for create_buffer_init
 
