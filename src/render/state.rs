@@ -10,8 +10,13 @@
 /// Be sure to check `Include > Custom Properties` and `Mesh > Apply Modifiers`.
 const SCENE: &str = "box.glb";
 
-/// The name of the skybox hdr or exr file to load from the [`assets/skybox/`](https://github.com/0dpe/path-tracer/tree/main/assets/skybox) directory to render by default.
+/// The name of the skybox file to load from the [`assets/skybox/`](https://github.com/0dpe/path-tracer/tree/main/assets/skybox) directory to render by default.
 const SKYBOX: &str = "kloppenheim_06_puresky_2k.hdr"; // https://polyhaven.com/a/kloppenheim_06_puresky
+
+/// Supported file extensions for the scene.
+const SCENE_EXTS: &[&str] = &["glb"];
+/// Supported file extensions for the skybox.
+const SKYBOX_EXTS: &[&str] = &["exr", "hdr", "jpeg", "jpg", "png", "webp"];
 
 use anyhow::Context;
 
@@ -680,6 +685,18 @@ impl State {
                 ..Default::default()
             });
 
+        let accumulation_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Accumulation"), // this is actually used as a texture, but since textures cannot be both read and write, a storage buffer is used instead
+            size: wgpu::BufferAddress::from(
+                texture_size.0 * texture_size.1 * 16, // 16 bytes per pixel for vec4<f32>
+            ),
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+
+        #[cfg(all(feature = "testing", not(target_arch = "wasm32")))]
+        log::info!("Accumulation buffer size: {}", accumulation_buffer.size());
+
         (
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("Compute bind group 0"),
@@ -692,16 +709,7 @@ impl State {
                     wgpu::BindGroupEntry {
                         binding: 1,
                         resource: wgpu::BindingResource::Buffer(
-                            device
-                                .create_buffer(&wgpu::BufferDescriptor {
-                                    label: Some("Accumulation buffer"), // this is actually used as a texture, but since textures cannot be both read and write, a storage buffer is used instead
-                                    size: wgpu::BufferAddress::from(
-                                        texture_size.0 * texture_size.1 * 16, // 16 bytes per pixel for vec4<f32>
-                                    ),
-                                    usage: wgpu::BufferUsages::STORAGE,
-                                    mapped_at_creation: false,
-                                })
-                                .as_entire_buffer_binding(),
+                            accumulation_buffer.as_entire_buffer_binding(),
                         ),
                     },
                 ],
@@ -861,11 +869,16 @@ impl State {
             label: &str,
             data: &[T],
         ) -> wgpu::Buffer {
-            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some(label),
                 contents: bytemuck::cast_slice(data),
                 usage: wgpu::BufferUsages::STORAGE,
-            })
+            });
+
+            #[cfg(all(feature = "testing", not(target_arch = "wasm32")))]
+            log::info!("{label} buffer: {} bytes", buffer.size());
+
+            buffer
         }
 
         let compute_1_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -982,12 +995,12 @@ impl State {
     fn spawn_file_picker(file_sender: std::sync::mpsc::Sender<UploadedFile>, is_scene: bool) {
         #[cfg(not(target_arch = "wasm32"))]
         std::thread::spawn(move || {
-            let mut dialog = rfd::FileDialog::new();
-            if is_scene {
-                dialog = dialog.add_filter("Scene", &["glb"]);
+            let dialog = rfd::FileDialog::new();
+            let dialog = if is_scene {
+                dialog.add_filter("Scene", SCENE_EXTS)
             } else {
-                dialog = dialog.add_filter("Skybox", &["hdr", "exr"]);
-            }
+                dialog.add_filter("Skybox", SKYBOX_EXTS)
+            };
             if let Some(path) = dialog.pick_file()
                 && let Ok(bytes) = std::fs::read(path)
             {
@@ -1000,12 +1013,12 @@ impl State {
         });
         #[cfg(target_arch = "wasm32")]
         wasm_bindgen_futures::spawn_local(async move {
-            let mut dialog = rfd::AsyncFileDialog::new();
-            if is_scene {
-                dialog = dialog.add_filter("Scene", &["glb"]);
+            let dialog = rfd::AsyncFileDialog::new();
+            let dialog = if is_scene {
+                dialog.add_filter("Scene", SCENE_EXTS)
             } else {
-                dialog = dialog.add_filter("Skybox", &["hdr", "exr"]);
-            }
+                dialog.add_filter("Skybox", SKYBOX_EXTS)
+            };
             if let Some(file) = dialog.pick_file().await {
                 let bytes = file.read().await;
                 let _ = file_sender.send(if is_scene {
@@ -1022,7 +1035,8 @@ impl State {
     /// recreating their bind groups [`State::compute_0_bind_group`] and [`State::render_0_bind_group`],
     /// and changing the camera aspect ratio to match the new surface size.
     pub(crate) fn resize(&mut self, width: u32, height: u32) {
-        // log::info!("Resize {width}x{height}");
+        #[cfg(all(feature = "testing", not(target_arch = "wasm32")))]
+        log::info!("Resize {width}x{height}");
 
         if width > 0 && height > 0 {
             self.surface_config.width = width;
@@ -1060,34 +1074,28 @@ impl State {
                 let mut dropped_skybox = None;
 
                 for file in &raw_input.dropped_files {
-                    if let Some(bytes) = &file.bytes {
-                        if std::path::Path::new(&file.name)
-                            .extension()
-                            .is_some_and(|ext| ext.eq_ignore_ascii_case("glb"))
-                        {
-                            dropped_glb = Some(bytes.to_vec());
-                        } else if std::path::Path::new(&file.name)
-                            .extension()
-                            .is_some_and(|ext| ext.eq_ignore_ascii_case("exr"))
-                            || std::path::Path::new(&file.name)
-                                .extension()
-                                .is_some_and(|ext| ext.eq_ignore_ascii_case("hdr"))
-                        {
-                            dropped_skybox = Some(bytes.to_vec());
-                        }
-                    } else if let Some(path) = &file.path
-                        && let Some(ext) = path.extension().and_then(|e| e.to_str())
+                    if let Some(ext) = file
+                        .path
+                        .as_deref()
+                        .unwrap_or_else(|| std::path::Path::new(&file.name))
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .map(str::to_lowercase)
                     {
-                        let ext_lower = ext.to_lowercase();
+                        let is_scene = SCENE_EXTS.contains(&ext.as_str());
+                        let is_skybox = SKYBOX_EXTS.contains(&ext.as_str());
 
-                        if ext_lower == "glb"
-                            && let Ok(bytes) = std::fs::read(path)
+                        if (is_scene || is_skybox)
+                            && let Some(bytes) =
+                                file.bytes.as_ref().map(|b| b.to_vec()).or_else(|| {
+                                    file.path.as_ref().and_then(|p| std::fs::read(p).ok())
+                                })
                         {
-                            dropped_glb = Some(bytes);
-                        } else if (ext_lower == "exr" || ext_lower == "hdr")
-                            && let Ok(bytes) = std::fs::read(path)
-                        {
-                            dropped_skybox = Some(bytes);
+                            if is_scene {
+                                dropped_glb = Some(bytes);
+                            } else if is_skybox {
+                                dropped_skybox = Some(bytes);
+                            }
                         }
                     }
                 }

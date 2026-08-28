@@ -44,14 +44,14 @@ const EXPOSURE = 0.00002604166;
 // TriangleGeometry and TriangleAttribute are separate structs just because the shader fetches vertices much more frequently than normals
 // although, actual benchmarks show that the performance difference is negligible, so they could be combined into one struct, but would require more padding, so they're kept separate for now
 struct TriangleGeometry {
-    coords: array<f32, 9>, // 3 vertices with x, y, z for each vertex
+    vertices: array<f32, 9>, // 3 vertices with x, y, z for each vertex
     // stored as a flat array since vec3<T> has alignment of 16 bytes, which misaligns with Rust's glam::Vec3 which has alignment of 12 bytes
     // using a flat array allows packing the vertex data without padding
     // the extra code like
-    // p0 = vec3f(tri.coords[0], tri.coords[1], tri.coords[2])
+    // v0 = vec3f(tri.vertices[0], tri.vertices[1], tri.vertices[2])
     // should be optimized by the compiler and not cause a performance difference
     // benchmarks show that using a flat array vs vec3 doesn't cause a performance difference
-};
+}
 struct TriangleAttribute {
     index: u32, // index into materials for the Material this triangle uses
     normals: array<f32, 9>, // same packing logic as TriangleGeometry for the normals of the 3 vertices
@@ -61,7 +61,7 @@ struct TriangleAttribute {
     t0: vec4f,
     t1: vec4f,
     t2: vec4f,
-};
+}
 
 struct BvhNode {
     aabb_min: vec3f,
@@ -99,17 +99,18 @@ struct Material {
     emission_uv: vec4f,
     specular_color_uv: vec4f,
     specular_weight_uv: vec4f,
-};
+}
 
 struct Camera {
     position: vec4f,
     lower_left_corner_minus_position: vec4f,
     horizontal: vec4f,
     vertical: vec4f,
-};
+}
 
 @group(0) @binding(0) var screen: texture_storage_2d<rgba32float, write>;
 @group(0) @binding(1) var<storage, read_write> accumulation_buffer: array<vec4f>; // this is actually used as a texture, but since textures cannot be both read and write, a storage buffer is used instead
+
 @group(1) @binding(0) var<storage, read> geometries: array<TriangleGeometry>;
 @group(1) @binding(1) var<storage, read> bvh_nodes: array<BvhNode>;
 @group(1) @binding(2) var<storage, read> attributes: array<TriangleAttribute>;
@@ -122,16 +123,6 @@ struct Camera {
 @group(1) @binding(9) var skybox_texture: texture_2d<f32>;
 @group(1) @binding(10) var<uniform> skybox_luminance: f32;
 @group(1) @binding(11) var skybox_sampler: sampler;
-
-struct Ray {
-    origin: vec3f, // camera origin position in world space
-    direction: vec3f, // normalized, direction going from camera origin to a point on the image plane
-    direction_reciprocal: vec3f, // precomputed reciprocal of direction for faster ray-box intersection; this optimization seems to barely improve performance, but it's common
-};
-
-fn fifth_power(x: f32) -> f32 {
-    return x * x * x * x * x;
-}
 
 // PCG random number generator
 // https://www.pcg-random.org/index.html
@@ -158,26 +149,113 @@ fn rand() -> f32 {
     return bitcast<f32>(0x3f800000u | bits) - 1.0;
 }
 
-// ray-aabb intersection during BVH traversal
-// returns the distance from ray_origin to the intersection (0.0 if already inside aabb), or -1.0 if missed
-// slab method
-fn intersect_aabb(node: BvhNode, ray_origin: vec3<f32>, inv_dir: vec3<f32>, closest_t: f32) -> f32 {
-    let t0 = (node.aabb_min - ray_origin) * inv_dir;
-    let t1 = (node.aabb_max - ray_origin) * inv_dir;
+fn fifth_power(x: f32) -> f32 {
+    return x * x * x * x * x;
+}
 
-    let tmin = min(t0, t1);
-    let tmax = max(t0, t1);
+// sample all lobes
+struct SampleLobesResult {
+    f_total: vec3f,
+    pdf_total: f32,
+}
+fn sample_lobes(
+    wo: vec3f, wi: vec3f,
+    p_ggx: f32, p_diffuse: f32,
+    base_color: vec3f, base_weight: f32, base_metalness: f32, base_diffuse_roughness: f32,
+    specular_color: vec3f, specular_weight: f32,
+    specular_ior_modulated: f32,
+    alpha: vec2f,
+    one_plus_lambda_wo: f32,
+    F0_conductor: vec3f,
+    E_dielectric: vec3f,
+    ltc_coefficients: vec4f, orthonormal_basis_ltc_wo: mat3x3f, P_u: f32, P_c: f32,
+) -> SampleLobesResult {
+    // half vector
+    let H = normalize(wo + wi);
+    let HdotW = dot(H, wo); // doesn't matter if it's dot(H, wi) or dot(H, wo) since they're equivalent
 
-    let t_near = max(max(tmin.x, tmin.y), tmin.z);
-    let t_far = min(min(tmax.x, tmax.y), tmax.z);
+    // https://www.pbr-book.org/4ed/Reflection_Models/Roughness_Using_Microfacet_Theory#eq:microfacet-lambda
+    let G1 = 1.0 / one_plus_lambda_wo;
 
-    // if the ray hits the aabb and it's closer than closest_t
-    if t_near <= t_far && t_far > 0.0 && t_near < closest_t {
-        // max(0.0, t_near) ensures that if the camera is inside the AABB, returns distance 0 instead of a negative value
-        return max(0.0, t_near);
-    }
+    // https://www.pbr-book.org/4ed/Reflection_Models/Roughness_Using_Microfacet_Theory#eq:microfacet-masking-shadowing-ross
+    // height-corrected
+    let G2 = 1.0 / (one_plus_lambda_wo + ggx_lambda(wi, alpha));
 
-    return -1.0; // missed
+    // GGX (Trowbridge-Reitz) normal distribution function, generalized to anisotropic
+    // https://www.pbr-book.org/4ed/Reflection_Models/Roughness_Using_Microfacet_Theory#eq:tr-d-function
+    // equivalent to OpenPBR eq.20 and Dupuy eq.12
+    // this form can be derived from these relationships:
+    //     H.x = sin(theta_m)cos(phi_m)
+    //     H.y = sin(theta_m)sin(phi_m)
+    //     H.z = cos(theta_m)
+    let D_helper = (H.x * H.x) / (alpha.x * alpha.x) + (H.y * H.y) / (alpha.y * alpha.y) + H.z * H.z;
+    let D = INV_PI / (alpha.x * alpha.y * D_helper * D_helper);
+
+    // https://pbr-book.org/4ed/Reflection_Models/Roughness_Using_Microfacet_Theory#eq:torrance-sparrow
+    let torrance_sparrow_without_fresnel = D * G2 / (4.0 * wi.z * wo.z);
+
+    // metal: Torrance-Sparrow, and Fresnel factor is F82-tint per OpenPBR Metallic Base section
+    // originally described in "Novel aspects of the Adobe Standard Material" by Peter Kutz, Milos Hasan, and Paul Edmondson (2021)
+    // https://helpx.adobe.com/content/dam/substance-3d-ecosystem-and-plugins/Adobe%20Standard%20Material%20-%20Technical%20Documentation.pdf
+    // mathematically equivalent to OpenPBR spec
+    let one_minus_HdotW = 1.0 - HdotW;
+    let F_82 = F0_conductor - fifth_power(one_minus_HdotW) * fma(
+        0.00105024005 * HdotW * one_minus_HdotW * (1.0 - specular_color), // 0.00105024005 ≈ 7^2 / 6^6
+        9031.0 * F0_conductor + 7776.0,
+        F0_conductor - 1.0
+    );
+    let f_conductor = saturate(specular_weight * F_82) * torrance_sparrow_without_fresnel;
+
+    // gloss: Torrance-Sparrow, and Fresnel factor with modulated IOR
+    let f_dielectric = specular_color * fresnel_exact(specular_ior_modulated, HdotW) * torrance_sparrow_without_fresnel;
+
+    // diffuse: EON
+    // Portsmouth Listing 1
+    let rho = base_color;
+    let s_f = dot(wi.xy, wo.xy);
+    let sovertF = select(s_f, s_f / max(wo.z, wi.z), s_f > 0.0);
+    let AF = 1.0 / fma(0.28779340921, base_diffuse_roughness, 1.0); // 0.28779340921 ≈ 0.5 - 2 / (3 * PI)
+    let f_ss = rho * INV_PI * AF * fma(base_diffuse_roughness, sovertF, 1.0);
+    let EFo = E_FON_exact(wo.z, base_diffuse_roughness);
+    let EFi = E_FON_exact(wi.z, base_diffuse_roughness);
+    let avgEF = AF * fma(0.07248821245, base_diffuse_roughness, 1.0); // 0.07248821245 ≈ 2 / 3 - 28 / (15 * PI)
+    let rho_ms = rho * rho * avgEF / (1.0 - rho * (1.0 - avgEF));
+    let f_ms = (rho_ms * INV_PI) * max(1.0e-7f, 1.0 - EFo)
+                                            * max(1.0e-7f, 1.0 - EFi)
+                                            / max(1.0e-7f, 1.0 - avgEF);
+    let f_diffuse = base_weight * (f_ss + f_ms);
+
+    // OpenPBR eq.47; non-reciprocal formulation
+    let f_glossy_diffuse = f_dielectric + (1.0 - E_dielectric) * f_diffuse; // TODO: could E_dielectric exceed 1?
+
+    let f_total = mix(f_glossy_diffuse, f_conductor, base_metalness);
+
+    let pdf_ggx = D * G1 / (4.0 * wo.z); // Dupuy eq.20
+
+    // Portsmouth Listing 4 pdf_EON
+    let wi_LTC = transpose(orthonormal_basis_ltc_wo) * wi;
+    let a = ltc_coefficients.x;
+    let b = ltc_coefficients.y;
+    let c = ltc_coefficients.z;
+    let d = ltc_coefficients.w;
+    let detM = c * (a - b * d);
+    let wh = vec3f(c * (wi_LTC.x - b * wi_LTC.z), (a - b * d) * wi_LTC.y, -c * (d * wi_LTC.x - a * wi_LTC.z));
+    let lenSqr = dot(wh, wh);
+    let s_pdf = fma(0.5, inverseSqrt(fma(d, d, 1.0)), 0.5);
+    let pdf_c = (detM * detM) / (lenSqr * lenSqr) * max(wh.z, 0.0) / (PI * s_pdf);
+    let pdf_eon = P_u * 0.15915494309 + P_c * pdf_c; // 0.15915494309 ≈ 1 / (2 * PI), is pdf_u
+
+    let pdf_total = p_ggx * pdf_ggx + p_diffuse * pdf_eon;
+
+    return SampleLobesResult(f_total, pdf_total);
+}
+
+// helper function for EON
+fn E_FON_exact(mu: f32, r: f32) -> f32 {
+    let AF = 1.0 / fma(0.28779340921, r, 1.0); // 0.28779340921 ≈ 0.5 - 2 / (3 * PI)
+    let Si = sqrt(fma(-mu, mu, 1.0));
+    let G = Si * (acos(mu) - Si * mu) + 0x1.555556p-1 * ((Si / mu) * (1.0 - (Si * Si * Si)) - Si); // the hexadecimal ≈ 2/3
+    return AF + r * AF * INV_PI * G;
 }
 
 // exact Fresnel
@@ -210,31 +288,6 @@ fn ggx_lambda(v: vec3f, a: vec2f) -> f32 {
     );
 }
 
-// GGX (Trowbridge-Reitz) normal distribution function, generalized to anisotropic
-// https://www.pbr-book.org/4ed/Reflection_Models/Roughness_Using_Microfacet_Theory#eq:tr-d-function
-// equivalent to OpenPBR eq.20 and Dupuy eq.12
-// this form can be derived from these relationships:
-//     H.x = sin(theta_m)cos(phi_m)
-//     H.y = sin(theta_m)sin(phi_m)
-//     H.z = cos(theta_m)
-fn ggx_D(H: vec3f, a: vec2f) -> f32 {
-    let D_helper = (H.x * H.x) / (a.x * a.x) + (H.y * H.y) / (a.y * a.y) + H.z * H.z;
-    return INV_PI / (a.x * a.y * D_helper * D_helper);
-}
-
-// F82-tint Fresnel factor for metal, per the OpenPBR Metallic Base section
-// originally described in "Novel aspects of the Adobe Standard Material" by Peter Kutz, Milos Hasan, and Paul Edmondson (2021)
-// https://helpx.adobe.com/content/dam/substance-3d-ecosystem-and-plugins/Adobe%20Standard%20Material%20-%20Technical%20Documentation.pdf
-// mathematically equivalent to OpenPBR spec
-fn f82_tint(F0: vec3f, tint: vec3f, mu: f32) -> vec3f {
-    let one_minus_mu = 1.0 - mu;
-    return F0 - fifth_power(one_minus_mu) * fma(
-        0.00105024005 * mu * one_minus_mu * (1.0 - tint), // 0.00105024005 ≈ 7^2 / 6^6
-        9031.0 * F0 + 7776.0,
-        F0 - 1.0
-    );
-}
-
 // VNDF sampling
 // a function here because this is used both when VNDF is chosen for calculating ray "incoming" direction and when calculating energy for layering gloss and diffuse
 fn sample_VNDF(wo: vec3f, a: vec2f, rand: f32, two_pi_rand: f32) -> vec3f {
@@ -247,47 +300,71 @@ fn sample_VNDF(wo: vec3f, a: vec2f, rand: f32, two_pi_rand: f32) -> vec3f {
     return normalize(vec3f(h.xy * a, h.z));
 }
 
-// used for EON
-fn ltc_coefficients(mu: f32, r: f32) -> vec4f {
-    let a = 1.0 + r * (0.303392 + (-0.518982 + 0.111709 * mu) * mu + (-0.276266 + 0.335918 * mu) * r);
-    let b = r * (-1.16407 + 1.15859 * mu + (0.150815 - 0.150105 * mu) * r) / (mu * mu * mu - 1.43545);
-    let c = 1.0 + r * (0.20013 + (-0.506373 + 0.261777 * mu) * mu);
-    let d = r * (0.540852 + (-1.01625 + 0.475392 * mu) * mu) / (-1.0743 + (0.0725628 + mu) * mu);
-    return vec4f(a, b, c, d);
+// OpenPBR eq.21
+// convert user-given parameters to alpha values (anisotropic)
+// returns alpha tangent and alpha bitangent, both > 0
+fn alpha_anisotropic(specular_roughness: f32, specular_roughness_anisotropy: f32) -> vec2f {
+    let isotropy = 1.0 - specular_roughness_anisotropy;
+    let alpha_t = specular_roughness * specular_roughness * 1.41421356237 * inverseSqrt(fma(isotropy, isotropy, 1.0)); // 1.41421356237 ≈ sqrt(2)
+    // isotropy and alpha_t can both be zero since specular_roughness can be 0.0 and specular_roughness_anisotropy can be 1.0;
+    // the D term in Torrance-Sparrow has division by (stuff * alpha), so alpha cannot be zero 
+    return max(vec2f(alpha_t, alpha_t * isotropy), vec2f(1e-4)); // 1e-4 is so close to 0.0, visually it's hard to tell a difference
 }
-fn cltc_pdf(wo: vec3f, wi: vec3f, r: f32) -> f32 {
-    let toLTC = transpose(orthonormal_basis_ltc(wo));
-    let wi_LTC = toLTC * wi;
 
-    let coeffs = ltc_coefficients(wo.z, r);
-    let a = coeffs.x; let b = coeffs.y; let c = coeffs.z; let d = coeffs.w;
+// OpenPBR eq.34 and eq.36
+// calculate modulated specular IOR ∈ (0, ∞), used for Fresnel calculations for dielectric base (all of base except for metal, which uses F82-tint model instead)
+fn specular_ior_modulated(specular_ior: f32, specular_weight: f32) -> f32 {
+    // we assume that ambient_ior = 1.0
 
-    let detM = c * (a - b * d);
-    let wh = vec3f(c * (wi_LTC.x - b * wi_LTC.z), (a - b * d) * wi_LTC.y, -c * (d * wi_LTC.x - a * wi_LTC.z));
-
-    let lenSqr = dot(wh, wh);
-    let vz = 1.0 / sqrt(d * d + 1.0);
-    let s = 0.5 * (1.0 + vz);
-
-    return (detM * detM) / (lenSqr * lenSqr) * max(wh.z, 0.0) / (PI * s);
+    let num = specular_ior - 1.0;
+    let den = specular_ior + 1.0;
+    let F0_dielectric = num * num / (den * den); // this must be positive mathematically
+    let F0_dielectric_sqrt = sign(specular_ior - 1.0) * sqrt(min(specular_weight * F0_dielectric, bitcast<f32>(0x3f800000u - 1u)));
+    // F0_dielectric_sqrt is in (-1, 1)
+    // bitcast<f32>(0x3f800000u - 1u) is the largest float smaller than 1.0, which seems to work here
+    // used here because there's division by (1.0 - F0_dielectric_sqrt) in the next line, so F0_dielectric_sqrt can't be 1.0 exactly
+    // 0x3F7FFFFF ≠ bitcast<f32>(0x3F7FFFFFu) = bitcast<f32>(0x3f800000u - 1u), by the way
+    return (1.0 + F0_dielectric_sqrt) / (1.0 - F0_dielectric_sqrt);
 }
-fn orthonormal_basis_ltc(w: vec3f) -> mat3x3f {
-    let lenSqr = dot(w.xy, w.xy);
-    var X = vec3f(1.0, 0.0, 0.0);
-    if lenSqr > 0.0 {
-        X = vec3f(w.x, w.y, 0.0) * inverseSqrt(lenSqr);
+
+// returns, for gloss, with a given light direction (wo), the percentage of light that reflects in all directions
+// 0% means the gloss surface absorbs all light, and 100% means it reflects all light (in whatever directions)
+// estimated on the fly (since we don't have precomputed LUTs)
+fn estimate_e_dielectric(wo: vec3f, one_plus_lambda_wo: f32, alpha: vec2f, specular_ior_modulated: f32, specular_color: vec3f) -> vec3f {
+    var sum_W = 0.0;
+    let num_samples = 16u;
+    for (var i = 0u; i < num_samples; i += 1u) {
+        let rand1 = rand();
+        let two_pi_rand = 2.0 * PI * rand();
+        let H = sample_VNDF(wo, alpha, rand1, two_pi_rand);
+        let wi = reflect(-wo, H);
+        if wi.z <= 0.0 { continue; } // TODO: bright fireflies when specular weight is 0.0, specular roughness is close to zero, and there are normals that aren't flat. diffuse roughness, base weight, base metalness, specular IOR, and specular anisotropy don't seem to matter very much
+        let F = fresnel_exact(specular_ior_modulated, dot(H, wo));
+        sum_W += F * one_plus_lambda_wo / (one_plus_lambda_wo + ggx_lambda(wi, alpha)); // F * G2 / G1
     }
-    let Y = vec3f(-X.y, X.x, 0.0);
-    return mat3x3f(X, Y, vec3f(0.0, 0.0, 1.0));
+    return specular_color * sum_W / f32(num_samples);
 }
-const FON_CONST1 = 0.28779340921; // ≈ 0.5 - 2 / (3 * PI)
-fn E_FON_exact(mu: f32, r: f32) -> f32 {
-    let AF = 1.0 / fma(FON_CONST1, r, 1.0);
-    let Si = sqrt(fma(-mu, mu, 1.0));
 
-    let G = Si * (acos(mu) - Si * mu) + 0x1.555556p-1 * ((Si / mu) * (1.0 - (Si * Si * Si)) - Si); // the hexadecimal ≈ 2/3
+// ray-aabb intersection during BVH traversal
+// returns the distance from ray_origin to the intersection (0.0 if already inside aabb), or -1.0 if missed
+// slab method
+fn intersect_aabb(node: BvhNode, neg_ray_origin_div_direction: vec3<f32>, ray_direction_reciprocal: vec3<f32>, hit_t: f32) -> f32 {
+    let t0 = fma(node.aabb_min, ray_direction_reciprocal, neg_ray_origin_div_direction);
+    let t1 = fma(node.aabb_max, ray_direction_reciprocal, neg_ray_origin_div_direction);
 
-    return AF + r * AF * INV_PI * G;
+    let tmin = min(t0, t1);
+    let tmax = max(t0, t1);
+
+    let t_near = max(max(tmin.x, tmin.y), tmin.z);
+    let t_far = min(min(tmax.x, tmax.y), tmax.z);
+
+    // if the ray hits the aabb and it's closer than hit_t
+    if t_near <= t_far && t_far > 0.0 && t_near < hit_t {
+        // max(0.0, t_near) ensures that if the camera is inside the AABB, returns distance 0 instead of a negative value
+        return max(0.0, t_near);
+    }
+
+    return -1.0; // missed
 }
 
 @compute @workgroup_size(8, 8, 1)
@@ -308,22 +385,21 @@ fn compute_main(@builtin(global_invocation_id) global_id: vec3u) {
     // + vec2f with rand() enables subpixel jitter for anti-aliasing (TAA)
     let pixel_uv = (vec2f(global_id.xy) + vec2f(rand(), rand())) / screen_dims;
 
-    // create a Ray with origin at camera and direction to the given image plane point
-    var ray: Ray;
-    ray.origin = camera.position.xyz;
+    // create a ray with origin at camera and direction to the given image plane point
+    var ray_origin = camera.position.xyz;
     // normalized vector going from camera origin to the image plane coordinate in world space
-    ray.direction = normalize(
+    var ray_direction = normalize(
         camera.lower_left_corner_minus_position.xyz + pixel_uv.x * camera.horizontal.xyz + pixel_uv.y * camera.vertical.xyz
     );
-    ray.direction_reciprocal = 1.0 / ray.direction; // division by zero can happen, but is rare
+    var ray_direction_reciprocal = 1.0 / ray_direction; // division by zero can happen, but is rare
 
     var throughput = vec3f(1.0, 1.0, 1.0);
     var final_color = vec3f(0.0, 0.0, 0.0);
 
     // path tracing loop
     for (var bounce = 0u; bounce < 10u; bounce += 1u) { // russian roulette is implemented, so this can be large
-        var closest_t = 0x1.fffffep+127f; // max float value IEEE-754 binary32; how far along the ray the intersection with a triangle is
-        // specifically, we use f(x) = m * x + b to find the exact coordinates of the intersection, where m is the ray direction, x is this closest_t, and b is the ray origin
+        var hit_t = 0x1.fffffep+127f; // max float value IEEE-754 binary32; how far along the ray the intersection with a triangle is
+        // specifically, we use f(x) = m * x + b to find the exact coordinates of the intersection, where m is the ray direction, x is this hit_t, and b is the ray origin
         var hit_index = -1; // if the ray intersects with a triangle, this is that triangle's index in geometries
         var hit_v = 0.0; // barycentric coordinates of the ray-triangle intersection
         var hit_w = 0.0;
@@ -333,29 +409,28 @@ fn compute_main(@builtin(global_invocation_id) global_id: vec3u) {
         // https://jcgt.org/published/0002/01/05/paper.pdf
         // intersection test setup (hoisted out of BVH loop)
 
-        let abs_d = abs(ray.direction);
+        let abs_d = abs(ray_direction);
         let kxy = select(1, 0, abs_d.x > abs_d.y);
         let kz = select(2, kxy, abs_d[kxy] > abs_d.z);
 
         let kx_val = select(kz + 1, 0, kz == 2);
         let ky_val = select(kx_val + 1, 0, kx_val == 2);
 
-        let is_neg = ray.direction[kz] < 0.0;
+        let is_neg = ray_direction[kz] < 0.0;
         let kx = select(kx_val, ky_val, is_neg);
         let ky = select(ky_val, kx_val, is_neg);
 
-        let Sz = ray.direction_reciprocal[kz];
+        let Sz = ray_direction_reciprocal[kz];
         // compared to the paper, extra negation here makes math later on simpler
-        let Sx = -ray.direction[kx] * Sz;
-        let Sy = -ray.direction[ky] * Sz;
+        let Sx = -ray_direction[kx] * Sz;
+        let Sy = -ray_direction[ky] * Sz;
 
         // setup fixed-size stack for BVH traversal (depth 64 is sufficient for millions of triangles)
         var stack: array<u32, 64>; // TODO: investigate if 64 can be set dynamically
-        var stack_ptr = 0u;
 
         // push root node
         stack[0] = 0u;
-        stack_ptr += 1u;
+        var stack_ptr = 1u;
 
         // BVH traversal
         while stack_ptr > 0u {
@@ -369,15 +444,15 @@ fn compute_main(@builtin(global_invocation_id) global_id: vec3u) {
                     let tri_index = node.left_first + i;
                     let tri = geometries[tri_index];
 
-                    let p0 = vec3f(tri.coords[0], tri.coords[1], tri.coords[2]);
-                    let p1 = vec3f(tri.coords[3], tri.coords[4], tri.coords[5]);
-                    let p2 = vec3f(tri.coords[6], tri.coords[7], tri.coords[8]);
+                    let v0 = vec3f(tri.vertices[0], tri.vertices[1], tri.vertices[2]);
+                    let v1 = vec3f(tri.vertices[3], tri.vertices[4], tri.vertices[5]);
+                    let v2 = vec3f(tri.vertices[6], tri.vertices[7], tri.vertices[8]);
 
                     // watertight ray-triangle intersection
 
-                    let A = p0 - ray.origin;
-                    let B = p1 - ray.origin;
-                    let C = p2 - ray.origin;
+                    let A = v0 - ray_origin;
+                    let B = v1 - ray_origin;
+                    let C = v2 - ray_origin;
 
                     let Ax = fma(Sx, A[kz], A[kx]);
                     let Ay = fma(Sy, A[kz], A[ky]);
@@ -386,27 +461,26 @@ fn compute_main(@builtin(global_invocation_id) global_id: vec3u) {
                     let Cx = fma(Sx, C[kz], C[kx]);
                     let Cy = fma(Sy, C[kz], C[ky]);
 
-                    let U = Cx * By - Cy * Bx;
-                    let V = Ax * Cy - Ay * Cx;
-                    let W = Bx * Ay - By * Ax;
+                    let U = fma(Cx, By, -Cy * Bx);
+                    let V = fma(Ax, Cy, -Ay * Cx);
+                    let W = fma(Bx, Ay, -By * Ax);
 
                     if min(U, min(V, W)) < 0.0 && max(U, max(V, W)) > 0.0 {
                         continue;
                     }
 
                     let det = U + V + W;
+
                     if det == 0.0 {
                         continue;
                     }
 
-                    let Az = Sz * A[kz];
-                    let Bz = Sz * B[kz];
-                    let Cz = Sz * C[kz];
                     let inv_det = 1.0 / det;
-                    let T = (U * Az + V * Bz + W * Cz) * inv_det;
 
-                    if T > 0.0 && T < closest_t {
-                        closest_t = T;
+                    let T = Sz * fma(U, A[kz], fma(V, B[kz], W * C[kz])) * inv_det;
+
+                    if T > 0.0 && T < hit_t {
+                        hit_t = T;
                         hit_index = i32(tri_index);
 
                         hit_v = V * inv_det;
@@ -419,8 +493,10 @@ fn compute_main(@builtin(global_invocation_id) global_id: vec3u) {
                 let left_index = node.left_first;
                 let right_index = node.left_first + 1u;
 
-                let dist_left = intersect_aabb(bvh_nodes[left_index], ray.origin, ray.direction_reciprocal, closest_t);
-                let dist_right = intersect_aabb(bvh_nodes[right_index], ray.origin, ray.direction_reciprocal, closest_t);
+                let neg_ray_origin_div_direction = -ray_origin * ray_direction_reciprocal;
+
+                let dist_left = intersect_aabb(bvh_nodes[left_index], neg_ray_origin_div_direction, ray_direction_reciprocal, hit_t);
+                let dist_right = intersect_aabb(bvh_nodes[right_index], neg_ray_origin_div_direction, ray_direction_reciprocal, hit_t);
 
                 let hit_left = dist_left >= 0.0;
                 let hit_right = dist_right >= 0.0;
@@ -428,13 +504,9 @@ fn compute_main(@builtin(global_invocation_id) global_id: vec3u) {
                 if hit_left && hit_right {
                     // both children nodes are hit
                     // push the further node first, so the closer node is popped first
-                    if dist_left < dist_right {
-                        stack[stack_ptr] = right_index;
-                        stack[stack_ptr + 1u] = left_index;
-                    } else {
-                        stack[stack_ptr] = left_index;
-                        stack[stack_ptr + 1u] = right_index;
-                    }
+                    let left_closer = dist_left < dist_right;
+                    stack[stack_ptr] = select(left_index, right_index, left_closer);
+                    stack[stack_ptr + 1u] = select(right_index, left_index, left_closer);
                     stack_ptr += 2u;
                 } else if hit_left {
                     stack[stack_ptr] = left_index;
@@ -452,7 +524,7 @@ fn compute_main(@builtin(global_invocation_id) global_id: vec3u) {
             // let sky_color = vec3f(0.0);
 
             // hard-edged color bands for easy reflection debugging
-            // let dir_y = ray.direction.y;
+            // let dir_y = ray_direction.y;
             // var raw_sky_color = vec3f(0.0);
             // if dir_y > 0.6 {
             //     raw_sky_color = vec3f(1.0, 0.0, 0.0); // red (top)
@@ -480,8 +552,8 @@ fn compute_main(@builtin(global_invocation_id) global_id: vec3u) {
 
             // use skybox texture
 
-            let u = fma(atan2(ray.direction.z, ray.direction.x), INV_2PI, 0.5);
-            let v = fma(-asin(ray.direction.y), INV_PI, 0.5);
+            let u = fma(atan2(ray_direction.z, ray_direction.x), INV_2PI, 0.5);
+            let v = fma(-asin(ray_direction.y), INV_PI, 0.5);
 
             let sky_color = textureSampleLevel(skybox_texture, skybox_sampler, vec2f(u, v), 0.0).rgb;
 
@@ -490,14 +562,32 @@ fn compute_main(@builtin(global_invocation_id) global_id: vec3u) {
         }
 
         let attr = attributes[u32(hit_index)];
-        let mat = materials[attr.index];
 
         // only 2 barycentric coordinates are given, but we know that the point is valid inside the triangle so all coordinates must sum to 1
         // so, the third barycentric coordinate can just be computed as 1 - (v + w)
         let hit_u = 1.0 - hit_v - hit_w;
         let interpolated_uv = fract(hit_u * attr.uv0 + hit_v * attr.uv1 + hit_w * attr.uv2); // fract is used to allow UVs outside of [0, 1] for tiling/repeating textures
 
+        let mat = materials[attr.index];
+
         var base_color = mat.base_color.rgb; // OpenPBR does not allow alpha in base_color, so alpha value is not used at all even though it is included in glTF
+        let base_weight = mat.base_weight;
+        var base_metalness = mat.base_metalness;
+        var base_diffuse_roughness = mat.base_diffuse_roughness;
+        let emission_weight = mat.emission_weight;
+        var emission_color = mat.emission_color_and_luminance.rgb;
+        let emission_luminance = mat.emission_color_and_luminance.a;
+        var specular_color = mat.specular_color_and_weight.rgb;
+        var specular_weight = mat.specular_color_and_weight.a;
+        let specular_roughness = mat.specular_roughness;
+        let specular_roughness_anisotropy = mat.specular_roughness_anisotropy;
+        // let specular_haze = mat.specular_haze;
+        // let specular_haze_spread = mat.specular_haze_spread;
+        let specular_ior = mat.specular_ior;
+        // let specular_retroreflectivity = mat.specular_retroreflectivity;
+
+        // TODO: specular haze and retroreflectivity are not implemented yet
+
         if mat.base_color_tex_layer >= 0 {
             let base_color_tex = textureSampleLevel(
                 srgb_texture_atlas,
@@ -509,9 +599,6 @@ fn compute_main(@builtin(global_invocation_id) global_id: vec3u) {
             base_color *= base_color_tex.rgb; // for base_color texture, the alpha channel is linear per glTF spec, but OpenPBR does not specify alpha channel for base_color, so it is ignored
             // not sure if textureSampleLevel() on a wgpu::TextureFormat::Rgba8UnormSrgb would convert the alpha channel to linear, though
         }
-
-        var base_metalness = mat.base_metalness;
-        var base_diffuse_roughness = mat.base_diffuse_roughness;
         if mat.metallic_roughness_tex_layer >= 0 {
             let mr_tex = textureSampleLevel(
                 linear_texture_atlas,
@@ -523,8 +610,6 @@ fn compute_main(@builtin(global_invocation_id) global_id: vec3u) {
             base_metalness *= mr_tex.b;
             base_diffuse_roughness *= mr_tex.g;
         }
-
-        var specular_color = mat.specular_color_and_weight.rgb;
         if mat.specular_color_tex_layer >= 0 {
             let specular_color_tex = textureSampleLevel(
                 srgb_texture_atlas,
@@ -535,8 +620,6 @@ fn compute_main(@builtin(global_invocation_id) global_id: vec3u) {
             );
             specular_color *= specular_color_tex.rgb; // alpha channel ignored per glTF spec; OpenPBR also doesn't specify alpha channel for specular color
         }
-
-        var specular_weight = mat.specular_color_and_weight.a;
         if mat.specular_weight_tex_layer >= 0 {
             let specular_factor_tex = textureSampleLevel(
                 linear_texture_atlas,
@@ -547,8 +630,6 @@ fn compute_main(@builtin(global_invocation_id) global_id: vec3u) {
             );
             specular_weight *= specular_factor_tex.a;
         }
-
-        var emission_color = mat.emission_color_and_luminance.rgb;
         if mat.emission_tex_layer >= 0 {
             let emission_tex = textureSampleLevel(
                 srgb_texture_atlas,
@@ -560,22 +641,22 @@ fn compute_main(@builtin(global_invocation_id) global_id: vec3u) {
             emission_color *= emission_tex.rgb; // alpha channel ignored per glTF spec; OpenPBR also doesn't specify alpha channel for emission color
         }
 
-        // emission_color is only a hue while emission_luminance is the actual luminance in nits; 
+        // emission_color is only a hue while emission_luminance is the actual luminance in nits;
         // normalize emission_color so its luminance is 1.0 before using it for final_color
         // this makes tweaking the emission_color artistically slightly unintuitive, but ensures that emission_luminance is the actual final luminance of the material
-        let emission_luma = dot(emission_color, LUMA_COEFFICIENTS);
-        if emission_luma > 0.0 {
-            final_color += throughput * mat.emission_weight * mat.emission_color_and_luminance.a * emission_color / emission_luma;
+        let emission_color_luminance = dot(emission_color, LUMA_COEFFICIENTS);
+        if emission_color_luminance > 0.0 {
+            final_color += throughput * emission_weight * emission_luminance * emission_color / emission_color_luminance;
         }
 
-        let V = -ray.direction; // view vector, going from the surface to the camera expressed in world space
+        let V = -ray_direction; // view vector, going from the surface to the camera expressed in world space
 
         // flat normals can be precomputed and passed to the shader in TriangleAttribute, but this calculation seems simple, so precomputation probably isn't better
         let tri = geometries[u32(hit_index)];
-        let p0 = vec3f(tri.coords[0], tri.coords[1], tri.coords[2]);
-        let p1 = vec3f(tri.coords[3], tri.coords[4], tri.coords[5]);
-        let p2 = vec3f(tri.coords[6], tri.coords[7], tri.coords[8]);
-        let flat_N_raw = normalize(cross(p1 - p0, p2 - p0));
+        let v0 = vec3f(tri.vertices[0], tri.vertices[1], tri.vertices[2]);
+        let v1 = vec3f(tri.vertices[3], tri.vertices[4], tri.vertices[5]);
+        let v2 = vec3f(tri.vertices[6], tri.vertices[7], tri.vertices[8]);
+        let flat_N_raw = normalize(cross(v1 - v0, v2 - v0));
         // normalize is safe since the triangle must be degenerate for the cross product to have length of zero
 
         // flat normal is used for this check, not normal interpolated with vertex normal
@@ -679,43 +760,15 @@ fn compute_main(@builtin(global_invocation_id) global_id: vec3u) {
         // M_PBR = mix(layer(S_diffuse, S_gloss), S_metal, base_metalness)
         // see https://github.com/AcademySoftwareFoundation/OpenPBR/tree/dev_1.2
 
-        // note that the following values should be used, not their original values in mat:
-        // base_color
-        // base_metalness
-        // base_diffuse_roughness
-        // specular_color
-        // specular_weight
+        let alpha = alpha_anisotropic(specular_roughness, specular_roughness_anisotropy);
 
-        // TODO 6: specular haze and retroreflectivity are not implemented yet
+        let specular_ior_modulated = specular_ior_modulated(specular_ior, specular_weight);
 
-        // convert user-given parameters to alpha values (anisotropic)
-        // OpenPBR eq.21
-        let isotropy = 1.0 - mat.specular_roughness_anisotropy;
-        let alpha_t = mat.specular_roughness * mat.specular_roughness * 1.41421356237 * inverseSqrt(fma(isotropy, isotropy, 1.0)); // 1.41421356237 ≈ sqrt(2)
-        // isotropy and alpha_t can both be zero since specular_roughness can be 0.0 and specular_roughness_anisotropy can be 1.0;
-        // the D term in Torrance-Sparrow has division by (stuff * alpha), so alpha cannot be zero 
-        // alpha tangent, alpha bitangent
-        let alpha = max(vec2f(alpha_t, alpha_t * isotropy), vec2f(1e-4)); // 1e-4 is so close to 0.0, visually it's hard to tell a difference
+        // there should be a check for TIR here: if specular_ior >= 1.0, just use Fresnel, else, TIR is possible
+        // no need to also check if specular_ior_modulated >= 1.0 since math guarantees that if specular_ior >= 1.0, specular_ior_modulated >= 1.0 as well
+        // when specular_ior < 1, specular_ior_modulate < 1 as well, except for when specular_weight = 0, for which specular_ior_modulated = 1 for all specular_ior
 
-        // calculate modulated IOR, used for Fresnel calculations for dielectric base (all of base except for metal, which uses F82-tint model instead)
-        // we assume that ambient_ior = 1.0
-        // OpenPBR eq.34 and eq.36
-        let num = mat.specular_ior - 1.0;
-        let den = mat.specular_ior + 1.0;
-        let F0_dielectric = num * num / (den * den); // this must be positive mathematically
-        let F0_dielectric_sqrt = sign(mat.specular_ior - 1.0) * sqrt(min(specular_weight * F0_dielectric, bitcast<f32>(0x3f800000u - 1u)));
-        // F0_dielectric_sqrt is in (-1, 1)
-        // bitcast<f32>(0x3f800000u - 1u) is the largest float smaller than 1.0, which seems to work here
-        // used here because there's division by (1.0 - F0_dielectric_sqrt) in the next line, so F0_dielectric_sqrt can't be 1.0 exactly
-        // 0x3F7FFFFF ≠ bitcast<f32>(0x3F7FFFFFu) = bitcast<f32>(0x3f800000u - 1u), by the way
-        let specular_ior_modulated = (1.0 + F0_dielectric_sqrt) / (1.0 - F0_dielectric_sqrt);
-        // specular_ior_modulated is in (0, ∞)
-
-        // there should be a check for TIR here: if mat.specular_ior >= 1.0, just use Fresnel, else, TIR is possible
-        // no need to also check if specular_ior_modulated >= 1.0 since math guarantees that if mat.specular_ior >= 1.0, specular_ior_modulated >= 1.0 as well
-        // when mat.specular_ior < 1, specular_ior_modulate < 1 as well, except for when specular_weight = 0, for which specular_ior_modulated = 1 for all mat.specular_ior
-
-        let F0_conductor = mat.base_weight * base_color; // OpenPBR right above eq.29; RGB reflectivity at normal incidence
+        let F0_conductor = base_weight * base_color; // OpenPBR right above eq.29; RGB reflectivity at normal incidence
 
         // ray, in local tangent space, going from the surface to the camera (or to the previous hit)
         // this ray is "outgoing," but note that since we're using reverse ray tracing, this ray is actually our input, the old ray direction
@@ -724,15 +777,34 @@ fn compute_main(@builtin(global_invocation_id) global_id: vec3u) {
         // the new ray direction
         var wi: vec3f;
 
-        // TODO 5: OpenPBR 3.6.3 Multiple Scattering: Torrance-Sparrow as it is used below (single-scattering) doesn't conserve energy, as it neglects to account for multiple scattering between the microfacets
+        // precompute some values
+        let one_plus_lambda_wo = 1.0 + ggx_lambda(wo, alpha);
+        let ltc_coefficients = vec4f(
+            1.0 + base_diffuse_roughness * (0.303392 + (-0.518982 + 0.111709 * wo.z) * wo.z + (-0.276266 + 0.335918 * wo.z) * base_diffuse_roughness),
+            base_diffuse_roughness * (-1.16407 + 1.15859 * wo.z + (0.150815 - 0.150105 * wo.z) * base_diffuse_roughness) / (wo.z * wo.z * wo.z - 1.43545),
+            1.0 + base_diffuse_roughness * (0.20013 + (-0.506373 + 0.261777 * wo.z) * wo.z),
+            base_diffuse_roughness * (0.540852 + (-1.01625 + 0.475392 * wo.z) * wo.z) / (-1.0743 + (0.0725628 + wo.z) * wo.z),
+        );
+        let orthonormal_basis_ltc_lenSqr = dot(wo.xy, wo.xy);
+        var orthonormal_basis_ltc_X = vec3f(1.0, 0.0, 0.0);
+        if orthonormal_basis_ltc_lenSqr > 0.0 {
+            orthonormal_basis_ltc_X = vec3f(wo.x, wo.y, 0.0) * inverseSqrt(orthonormal_basis_ltc_lenSqr);
+        }
+        let orthonormal_basis_ltc_wo = mat3x3f(
+            orthonormal_basis_ltc_X,
+            vec3f(-orthonormal_basis_ltc_X.y, orthonormal_basis_ltc_X.x, 0.0),
+            vec3f(0.0, 0.0, 1.0)
+        );
+
+        // TODO: OpenPBR 3.6.3 Multiple Scattering: Torrance-Sparrow as it is used below (single-scattering) doesn't conserve energy, as it neglects to account for multiple scattering between the microfacets
         // TODO: white furnace test fails slightly, unrelated to multiple scattering, related to EON
 
-        // metal (f_conductor), gloss (f_dielectric), and diffuse (f_diffuse) all are described by microfacet model
+        // metal (f_conductor), gloss (f_dielectric), and diffuse (f_diffuse), referred to as "lobes," all are described by microfacet model
         // we assume that specifically, metal and gloss have microfacets of perfect mirror-like surface
-        // thus, both metal and gloss can use the Torrance-Sparrow (or Cook-Torrance) equation for their BRDFs
-        // the only thing that differs between metal and gloss is their Fresnel factor in their Torrance-Sparrow BRDF equations
+        // thus, both metal and gloss can use the Torrance-Sparrow (or Cook-Torrance) equation as their BRDFs
+        // the only thing that differs between metal and gloss is their Fresnel factor in their Torrance-Sparrow BRDFs
         // diffuse, though, has microfacets of Lambertian surface, not mirror-like
-        // so, diffuse doesn't use Torrance-Sparrow, but instead uses energy-preserving Oren-Nayar (EON)
+        // so, diffuse doesn't use Torrance-Sparrow, but instead uses energy-preserving Oren-Nayar (EON) BRDF
 
         // note that OpenPBR states, "For dielectrics there is also a BTDF..."
         // but that is not implemented here since layering is done with albedo-scaling approximation (with E_dielectric below)
@@ -750,50 +822,30 @@ fn compute_main(@builtin(global_invocation_id) global_id: vec3u) {
         // below, we do importance sampling for determining a singular wi
         // we choose only a singular wi because otherwise, the amount of rays to evaluate would explode exponentially
         // we use importance sampling because there are multiple sampling strategies for determining a wi, and we reduce variance by assigning each strategy a different probability of being chosen:
-        // for metal and gloss, for the D term (normal distribution function) in Torrance-Sparrow, we use GGX (Trowbridge-Reitz); to sample this GGX normal distribution function, we use the VNDF (visible normal distribution function) sampling strategy
-        // for diffuse, EON has its own equations, including its own sampling strategy (a mix between uniform and CLTC sampling)
+        // for metal and gloss, for the normal distribution function (D term) in Torrance-Sparrow BRDF, we use GGX (Trowbridge-Reitz); to sample this GGX normal distribution function, we use the VNDF (visible normal distribution function) sampling strategy
+        // for diffuse, EON BRDF has its own sampling strategy (a mix between uniform and CLTC sampling)
         // hence, we calculate probabilities for selecting either VNDF or EON sampling
 
-        // E_dielectric is, for gloss, with a given light direction (wo), the percentage of light that reflects in all directions
-        // 0% means the gloss surface absorbs all light, and 100% means it reflects all light (in whatever directions)
-        // estimated on the fly (since we don't have precomputed LUTs)
         // E_dielectric is used to calculate better probabilities below and also to calculate f_glossy_diffuse with albedo-scaling approximation later
-        let one_plus_lambda_wo = 1.0 + ggx_lambda(wo, alpha);
-        var sum_W = 0.0;
-        let num_samples = 16u;
-        for (var i = 0u; i < num_samples; i += 1u) {
-            let rand1 = rand();
-            let two_pi_rand = 2.0 * PI * rand();
-            let H = sample_VNDF(wo, alpha, rand1, two_pi_rand);
-            let wi = reflect(-wo, H);
-            if wi.z <= 0.0 { continue; } // TODO: bright fireflies when specular weight is 0.0, specular roughness is close to zero, and there are normals that aren't flat. diffuse roughness, base weight, base metalness, specular IOR, and specular anisotropy don't seem to matter very much
-            let F = fresnel_exact(specular_ior_modulated, dot(H, wo));
-            sum_W += F * one_plus_lambda_wo / (one_plus_lambda_wo + ggx_lambda(wi, alpha)); // F * G2 / G1
-        }
-        let E_dielectric = specular_color * sum_W / f32(num_samples);
+        let E_dielectric = estimate_e_dielectric(wo, one_plus_lambda_wo, alpha, specular_ior_modulated, specular_color);
 
         // calculate probabilities for selecting either VNDF or EON sampling
 
         let albedo_gloss = dot(E_dielectric, LUMA_COEFFICIENTS);
-        let albedo_diffuse = (1.0 - albedo_gloss) * mat.base_weight * dot(base_color, LUMA_COEFFICIENTS);
-        let fresnel_schlick_metal = F0_conductor + (1.0 - F0_conductor) * fifth_power(1.0 - NdotV);
+        let albedo_diffuse = (1.0 - albedo_gloss) * base_weight * dot(base_color, LUMA_COEFFICIENTS);
+        let fresnel_schlick_metal = F0_conductor + (1.0 - F0_conductor) * fifth_power(1.0 - wo.z);
         let albedo_metal = dot(fresnel_schlick_metal, LUMA_COEFFICIENTS);
 
         let w_ggx = mix(albedo_gloss, albedo_metal, base_metalness);
         let w_diffuse = (1.0 - base_metalness) * albedo_diffuse;
 
+        // probabilities
         let p_ggx = clamp(w_ggx / max(w_ggx + w_diffuse, 1e-7), 0.1, 0.9); // TODO: this 1e-7 small number hasn't been tested
         let p_diffuse = 1.0 - p_ggx;
 
-        // a var is declared here because if EON is chosen, the EON pdf is calculated along with wi together at the same time
-        // this is because calculating pdf does not require many extra math steps when calculating wi simultaneously
-        // if GGX is chosen instead, pdf_eon stays unmodified as -1.0
-        // so later on, we check if pdf_eon == -1.0 and calculate EON pdf if true, else just use existing value
-        var pdf_eon = -1.0;
-
         // compute two values for EON
         // will be needed no matter if EON sampling is chosen or not, since in the end, need to calculate total PDF which includes calculating EON PDF, which needs these two values
-        let P_u = pow(base_diffuse_roughness, 0.1) * (0.162925 + (-0.372058 + (0.538233 - 0.290822 * NdotV) * NdotV) * NdotV); // base_diffuse_roughness of 0.0 causes P_u to be 0.0
+        let P_u = pow(base_diffuse_roughness, 0.1) * (0.162925 + (-0.372058 + (0.538233 - 0.290822 * wo.z) * wo.z) * wo.z); // base_diffuse_roughness of 0.0 causes P_u to be 0.0
         let P_c = 1.0 - P_u;
 
         let two_pi_rand = 2.0 * PI * rand();
@@ -813,104 +865,53 @@ fn compute_main(@builtin(global_invocation_id) global_id: vec3u) {
 
             // Listing 4 sample_EON
 
-            var pdf_c: f32;
             // note that the paper specifies random numbers in [0, 1]; using [0, 1) instead shouldn't matter
             if rand1 < P_u { // rand1 <= P_u is problematic in the paper; P_u and rand1 being both 0.0 would cause division by zero
-                // sample uniform lobe
+                // sample uniformly
+
                 let u1 = rand1 / P_u; // cannot be division by zero since rand1 < P_u is the condition
                 let sinTheta = sqrt(1.0 - u1 * u1);
                 wi = vec3f(sinTheta * cos(two_pi_rand), sinTheta * sin(two_pi_rand), u1);
-                pdf_c = cltc_pdf(wo, wi, base_diffuse_roughness);
             } else {
-                // sample CLTC lobe
+                // sample with CLTC
+
                 let u1 = (rand1 - P_u) / P_c;
 
-                let coeffs = ltc_coefficients(NdotV, base_diffuse_roughness);
-                let a = coeffs.x; let b = coeffs.y; let c = coeffs.z; let d = coeffs.w;
+                let a = ltc_coefficients.x;
+                let b = ltc_coefficients.y;
+                let c = ltc_coefficients.z;
+                let d = ltc_coefficients.w;
                 let R = sqrt(u1);
-                var x = R * cos(two_pi_rand);
                 let y = R * sin(two_pi_rand);
-                let vz = inverseSqrt(d * d + 1.0);
-                let s = 0.5 * (1.0 + vz);
-                x = -mix(sqrt(1.0 - y * y), x, s);
+                let s = fma(0.5, inverseSqrt(fma(d, d, 1.0)), 0.5);
+                let x = -mix(sqrt(fma(-y, y, 1.0)), R * cos(two_pi_rand), s);
                 let wh = vec3f(x, y, sqrt(max(1.0 - (x * x + y * y), 0.0)));
-                let pdf_wh = wh.z / (PI * s);
                 let wi_unnormalized = vec3f(a * wh.x + b * wh.z, c * wh.y, d * wh.x + wh.z);
-                let len = length(wi_unnormalized);
-                let detM = c * (a - b * d);
-                let fromLTC = orthonormal_basis_ltc(wo);
 
-                wi = normalize(fromLTC * wi_unnormalized);
-                pdf_c = pdf_wh * len * len * len / detM;
+                wi = normalize(orthonormal_basis_ltc_wo * wi_unnormalized);
             }
-
-            pdf_eon = P_u * 0.15915494309 + P_c * pdf_c; // 0.15915494309 ≈ 1 / (2 * PI), is pdf_u
         }
 
         // if "incoming" ray goes beneath the surface, this ray ends
         // TODO: bright fireflies when specular weight is 0.0, specular roughness is close to zero, and there are normals that aren't flat. diffuse roughness, base weight, base metalness, specular IOR, and specular anisotropy don't seem to matter very much
         if wi.z <= 0.0 { break; }
 
-        let H = normalize(wo + wi);
+        let sample_lobes_result = sample_lobes(
+            wo, wi,
+            p_ggx, p_diffuse,
+            base_color, base_weight, base_metalness, base_diffuse_roughness, specular_color, specular_weight,
+            specular_ior_modulated,
+            alpha,
+            one_plus_lambda_wo,
+            F0_conductor,
+            E_dielectric,
+            ltc_coefficients, orthonormal_basis_ltc_wo, P_u, P_c
+        );
 
-        // https://www.pbr-book.org/4ed/Reflection_Models/Roughness_Using_Microfacet_Theory#eq:microfacet-lambda
-        let G1 = 1.0 / one_plus_lambda_wo;
+        throughput *= sample_lobes_result.f_total * wi.z / sample_lobes_result.pdf_total;
 
-        // https://www.pbr-book.org/4ed/Reflection_Models/Roughness_Using_Microfacet_Theory#eq:microfacet-masking-shadowing-ross
-        // height-corrected
-        let G2 = 1.0 / (one_plus_lambda_wo + ggx_lambda(wi, alpha));
-
-        let D = ggx_D(H, alpha);
-
-        // https://pbr-book.org/4ed/Reflection_Models/Roughness_Using_Microfacet_Theory#eq:torrance-sparrow
-        let torrance_sparrow_without_fresnel = D * G2 / (4.0 * wi.z * NdotV);
-        // where wi.z = cos(theta_i) and wo.z = cos(theta_o) = NdotV mathematically
-
-        // evaluate all lobes
-
-        let HdotW = dot(H, wo); // doesn't matter if it's dot(H, wi) or dot(H, wo) since they're equivalent
-
-        // metal: Torrance-Sparrow, and Fresnel factor is F82-tint per OpenPBR Metallic Base section
-        let F_82 = f82_tint(F0_conductor, specular_color, HdotW);
-        let f_conductor = saturate(specular_weight * F_82) * torrance_sparrow_without_fresnel;
-
-        // gloss: Torrance-Sparrow, and Fresnel factor with modulated IOR
-        let f_dielectric = specular_color * fresnel_exact(specular_ior_modulated, HdotW) * torrance_sparrow_without_fresnel;
-
-        // diffuse: EON
-        // Listing 1
-        let rho = base_color;
-        let s = dot(wi.xy, wo.xy);
-        let sovertF = select(s, s / max(NdotV, wi.z), s > 0.0);
-        let AF = 1.0 / fma(FON_CONST1, base_diffuse_roughness, 1.0);
-        let f_ss = rho * INV_PI * AF * fma(base_diffuse_roughness, sovertF, 1.0);
-        let EFo = E_FON_exact(NdotV, base_diffuse_roughness);
-        let EFi = E_FON_exact(wi.z, base_diffuse_roughness);
-        let avgEF = AF * fma(0.07248821245, base_diffuse_roughness, 1.0); // 0.07248821245 ≈ 2 / 3 - 28 / (15 * PI)
-        let rho_ms = rho * rho * avgEF / (1.0 - rho * (1.0 - avgEF));
-        let f_ms = (rho_ms * INV_PI) * max(1.0e-7f, 1.0 - EFo)
-                                                * max(1.0e-7f, 1.0 - EFi)
-                                                / max(1.0e-7f, 1.0 - avgEF);
-        let f_diffuse = mat.base_weight * (f_ss + f_ms);
-
-        // OpenPBR eq.47; non-reciprocal formulation
-        let f_glossy_diffuse = f_dielectric + (1.0 - E_dielectric) * f_diffuse; // TODO: could E_dielectric exceed 1?
-
-        let f_total = mix(f_glossy_diffuse, f_conductor, base_metalness);
-
-        // evaluate entire PDF
-
-        let pdf_ggx = D * G1 / (4.0 * NdotV); // Dupuy eq.20
-
-        if pdf_eon == -1.0 {
-            // Portsmouth Listing 4 pdf_EON
-            let pdf_c = cltc_pdf(wo, wi, base_diffuse_roughness);
-            pdf_eon = P_u * 0.15915494309 + P_c * pdf_c; // 0.15915494309 ≈ 1 / (2 * PI), is pdf_u
-        }
-
-        throughput *= f_total * wi.z / (p_ggx * pdf_ggx + p_diffuse * pdf_eon);
-
-        // russian roulette: terminate paths early if they contribute very little light
+        // russian roulette
+        // terminate paths early if they contribute very little light
         if bounce > 3u { // don't start terminating until after a few bounces to allow light to bounce around and contribute meaningfully
             let p_survive = clamp(max(throughput.x, max(throughput.y, throughput.z)), 0.05, 0.95);
             if rand() > p_survive {
@@ -923,13 +924,12 @@ fn compute_main(@builtin(global_invocation_id) global_id: vec3u) {
             throughput /= p_survive;
         }
 
-        // this matches f(x) = m * x + b, but in this case in 3D, f(x) outputs a vec3 point, which is the intersection point
-        let hit_p = ray.direction * closest_t + ray.origin;
+        let hit_point = ray_direction * hit_t + ray_origin; // this matches f(x) = m * x + b
 
         // offset ray origin slightly to prevent self-intersection shadowing (shadow acne)
-        ray.origin = hit_p + flat_N * max(1e-4, 1e-4 * length(hit_p));
-        ray.direction = wi.x * T + wi.y * B + wi.z * N;
-        ray.direction_reciprocal = 1.0 / ray.direction;
+        ray_origin = hit_point + flat_N * max(1e-4, 1e-4 * length(hit_point));
+        ray_direction = wi.x * T + wi.y * B + wi.z * N;
+        ray_direction_reciprocal = 1.0 / ray_direction;
     }
 
     // blend current frame into accumulation buffer

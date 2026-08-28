@@ -15,13 +15,11 @@ pub const ATLAS_SIZE: u32 = 8192;
 
 // TODO: fix transparency in textures; parsing is done correctly, but shader is not correct. also, in gltf::material, parse alpha_mode and alpha_cutoff to do this properly
 // TODO: add vertex colors
-// TODO IP: wasm32 build failing due to bug in egui-winit 30, also version 30 greatly worsened performance
+// TODO: wasm32 build failing due to bug in egui-winit 30, also version 30 greatly worsened performance
 // TODO: there are lag spikes (not related to wgpu version 30), occurring at set amount of time elapsed after application first runs, which slows down frame rate by some percentage (not absolute change in frame rate)
 // TODO: render at a smaller resolution by default (maybe by somehow running an auto benchmark before anything runs to determine the user's hardware capabilities), and allow user to adjust resolution, so the app doesn't crash the user's computer
 
 /// Contains all the data loaded from a glTF 2.0 .glb file, formatted for the GPU.
-///
-/// The coordinate system is: +X to the right of the screen, +Y up the screen, and -Z into the screen.
 pub struct Scene {
     // geometries[i] and attributes[i] together represent a triangle at index i
     // hence, only GpuTriangleAttribute contains material index (geometries doesn't contain any index)
@@ -96,9 +94,9 @@ pub struct GpuTriangleGeometry {
     // bytemuck::Pod requires alignment without implicit padding
     // although glam::Vec3A is 16 byte aligned, it has padding
     // WebGPU requirements: https://www.w3.org/TR/WGSL/#alignment-and-size
-    p0: glam::Vec3,
-    p1: glam::Vec3,
-    p2: glam::Vec3,
+    v0: glam::Vec3,
+    v1: glam::Vec3,
+    v2: glam::Vec3,
 }
 
 /// Contains the material index and vertex attributes of a triangle.
@@ -752,21 +750,21 @@ impl Scene {
                         let [i0, i1, i2] =
                             [chunk[0] as usize, chunk[1] as usize, chunk[2] as usize];
 
-                        let p0 = temp_prim_positions[i0];
-                        let p1 = temp_prim_positions[i1];
-                        let p2 = temp_prim_positions[i2];
+                        let v0 = temp_prim_positions[i0];
+                        let v1 = temp_prim_positions[i1];
+                        let v2 = temp_prim_positions[i2];
 
                         // calculate AABB and centroid of this triangle for the BVH builder later
                         bvh_triangles.push(BvhTriangle {
                             aabb: Aabb {
-                                min: p0.min(p1).min(p2),
-                                max: p0.max(p1).max(p2),
+                                min: v0.min(v1).min(v2),
+                                max: v0.max(v1).max(v2),
                             },
-                            centroid: (p0 + p1 + p2) / 3.0,
+                            centroid: (v0 + v1 + v2) / 3.0,
                             original_index: geometries.len(),
                         });
 
-                        geometries.push(GpuTriangleGeometry { p0, p1, p2 });
+                        geometries.push(GpuTriangleGeometry { v0, v1, v2 });
 
                         let (t0, t1, t2) = if use_computed_tangents {
                             let base = tri * 3;
@@ -1143,9 +1141,9 @@ impl Scene {
                     let tri_index = (node.left_first + i) as usize;
                     let tri = self.geometries[tri_index];
 
-                    let a = (tri.p0 - self.camera.position).to_array();
-                    let b = (tri.p1 - self.camera.position).to_array();
-                    let c = (tri.p2 - self.camera.position).to_array();
+                    let a = (tri.v0 - self.camera.position).to_array();
+                    let b = (tri.v1 - self.camera.position).to_array();
+                    let c = (tri.v2 - self.camera.position).to_array();
 
                     let ax = sx * a[kz] + a[kx];
                     let ay = sy * a[kz] + a[ky];
@@ -1354,37 +1352,99 @@ impl Skybox {
     /// Create a new [`Skybox`] using [`image::load_from_memory()`] with the given `bytes`.
     pub fn new(bytes: &[u8]) -> anyhow::Result<Self> {
         let img = image::load_from_memory(bytes)?.into_rgba32f();
+        // alpha isn't used, but still stored and passed to the compute shader since there's no Rgb32Float wgpu::TextureFormat
+
         let (width, height) = img.dimensions();
+        if width / 2 != height {
+            log::warn!("Skybox image should usually be 2:1 aspect ratio, but is {width}x{height}");
+        }
+
         let mut pixels = img.into_raw();
+        // pixels[0, 1, 2, 3] are the RGBA values of pixel at the top-left corner
+        // then, increasing indices go row-major (rightward first, then downward)
+
+        let mut max_luma = 0.0f32;
 
         let mut total_luma = 0.0;
+        let mut total_weight = 0.0;
 
-        for i in (0..pixels.len()).step_by(4) {
-            let r = pixels[i];
-            let g = pixels[i + 1];
-            let b = pixels[i + 2];
-            total_luma += r.mul_add(0.2126, g.mul_add(0.7152, b * 0.0722)); // standard Rec. 709 coefficients to convert RGB -> luminance value
+        // calculate average and max luma
+        for y in 0..height {
+            // the zenith angle or colatitude, the angle downward from the north pole (y = 0 are the topmost pixels)
+            let theta = (y as f32).mul_add(std::f32::consts::PI, std::f32::consts::FRAC_PI_2)
+                / height as f32;
+            let weight = theta.sin();
+
+            for x in 0..width {
+                let index = ((y * width + x) * 4) as usize;
+                let r = pixels[index];
+                let g = pixels[index + 1];
+                let b = pixels[index + 2];
+
+                let luma = r.mul_add(0.2126, g.mul_add(0.7152, b * 0.0722));
+                // standard Rec. 709 coefficients to convert RGB -> luminance value
+
+                max_luma = max_luma.max(luma);
+                total_luma += luma * weight;
+                total_weight += weight;
+            }
         }
 
-        let avg_luma = total_luma / (width * height) as f32;
+        // total_weight is zero only when height or width is zero, which is impossible
 
-        let scale_factor = if avg_luma > 0.0 {
-            avg_luma.recip()
-        } else {
-            1.0
-        };
+        // total_luma is zero only when height or width is zero or all pixels are black
+        // then, just return a black texture
+        if total_luma == 0.0 {
+            log::info!("Loaded completely black skybox");
 
-        for i in (0..pixels.len()).step_by(4) {
-            pixels[i] *= scale_factor;
-            pixels[i + 1] *= scale_factor;
-            pixels[i + 2] *= scale_factor;
-            // pixels[i+3] is alpha, leave it alone
+            return Ok(Self {
+                luminance: 0.0,
+                width: 1,
+                height: 1,
+                rgba: vec![0.0; 4],
+            });
         }
 
-        log::info!("Loaded skybox with dimensions {width}x{height}");
+        let avg_luma = total_luma / total_weight;
+        let scale_factor = avg_luma.recip();
+
+        // used to calculate standard deviation
+        let mut variance_sum = 0.0;
+
+        for y in 0..height {
+            let theta = (y as f32).mul_add(std::f32::consts::PI, std::f32::consts::FRAC_PI_2)
+                / height as f32;
+            let weight = theta.sin();
+
+            for x in 0..width {
+                let index = ((y * width + x) * 4) as usize;
+                // scale pixels so average luminance is 1 nit
+                pixels[index] *= scale_factor;
+                pixels[index + 1] *= scale_factor;
+                pixels[index + 2] *= scale_factor;
+
+                // recalculate luma after scaling to measure variance
+                let r = pixels[index];
+                let g = pixels[index + 1];
+                let b = pixels[index + 2];
+                let scaled_luma = r.mul_add(0.2126, g.mul_add(0.7152, b * 0.0722));
+
+                // because pixels are scaled, the mean is exactly 1.0
+                // variance is the squared difference from the mean
+                let diff = scaled_luma - 1.0;
+                variance_sum += (diff * diff) * weight;
+            }
+        }
+
+        // completely uniform skybox: max_to_avg_luma = 1.0, standard_deviation = 0.0
+        let standard_deviation = (variance_sum / total_weight).sqrt();
+        let max_to_avg_luma = max_luma * scale_factor; // equivalent to max_luma / avg_luma
+
+        log::info!(
+            "Loaded skybox {width}x{height} with originally {avg_luma} nits on average, {max_to_avg_luma} max/avg nits, standard deviation of {standard_deviation}"
+        );
 
         Ok(Self {
-            // this preserves the skybox's original average luminance
             luminance: avg_luma,
             width,
             height,
@@ -1659,6 +1719,8 @@ impl Camera {
     }
 
     /// Move the camera to a specific world-space position and rotation; yaw and pitch in radians.
+    ///
+    /// The coordinate system is: +X to the right of the screen, +Y up the screen, and -Z into the screen.
     pub fn translate_and_rotate_to(
         &mut self,
         position: Option<glam::Vec3>,

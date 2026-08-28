@@ -203,11 +203,11 @@ pub fn run_base(
                     ui.add_space(ui.spacing().item_spacing.y * 2.0);
 
                     ui.collapsing("Scene", |ui| {
-                        if ui.button("Upload scene (glb)").clicked() {
+                        if ui.button("Upload scene").clicked() {
                             actions.push(BaseUiAction::UploadScene);
                         }
 
-                        if ui.button("Upload skybox (hdr/exr)").clicked() {
+                        if ui.button("Upload skybox").clicked() {
                             actions.push(BaseUiAction::UploadSkybox);
                         }
 

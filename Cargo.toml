@@ -66,6 +66,9 @@ gltf = { version = "1.4.1", default-features = false, features = [
 image = { version = "0.25.10", default-features = false, features = [
     "exr",
     "hdr",
+    "jpeg",
+    "png",
+    "webp",
 ] }
 bytemuck = { version = "1.25.2", default-features = false, features = [
     "derive",
@@ -128,7 +131,7 @@ serde-saphyr = { version = "1.1.0", default-features = false, features = [
 wgpu-profiler = { version = "0.27.0", default-features = false, features = [
     "tracy",
 ], optional = true }
-tracy-client = { version = "0.18.4", optional = true }
+tracy-client = { version = "0.18.5", optional = true }
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }

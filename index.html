@@ -42,6 +42,41 @@
             border-radius: 4px;
             z-index: 5;
             display: none;
+            opacity: 1;
+            transition: opacity 2s ease;
+            box-sizing: border-box;
+        }
+
+        #bottom-right-logs.is-fading {
+            opacity: 0;
+        }
+
+        #bottom-right-logs.is-faded {
+            pointer-events: none;
+        }
+
+        #bottom-right-logs.is-hovered {
+            opacity: 1;
+            transition: none;
+        }
+
+        #close-logs {
+            position: absolute;
+            top: 4px;
+            right: 4px;
+            width: 20px;
+            height: 20px;
+            padding: 0;
+            border: 0;
+            background: transparent;
+            color: #fff;
+            cursor: pointer;
+            font: 16px/20px sans-serif;
+            opacity: 0.8;
+        }
+
+        #close-logs:hover {
+            opacity: 1;
         }
 
         .overlay {
@@ -132,7 +167,9 @@
 <body>
     <canvas id="rust-insert-wasm"></canvas>
 
-    <div id="bottom-right-logs"></div>
+    <div id="bottom-right-logs">
+        <button id="close-logs" type="button" aria-label="Close logs">&times;</button>
+    </div>
 
     <div id="loading-screen" class="overlay">
         <div class="spinner"></div>
@@ -155,8 +192,53 @@
         const bottomRightLogs = document.getElementById("bottom-right-logs");
         const errorDisplay = document.getElementById("error-display");
         const errorMessage = document.getElementById("error-message");
+        const closeLogs = document.getElementById("close-logs");
 
         let presentedFirstFrame = false;
+        let logsAreHovered = false;
+        let hideLogsTimer;
+
+        function resetLogFade() {
+            clearTimeout(hideLogsTimer);
+            bottomRightLogs.classList.remove("is-fading");
+
+            if (!logsAreHovered) {
+                hideLogsTimer = setTimeout(() => {
+                    if (!logsAreHovered) {
+                        bottomRightLogs.classList.add("is-fading");
+                    }
+                }, 5000);
+            }
+        }
+
+        bottomRightLogs.addEventListener("transitionend", (event) => {
+            if (event.propertyName === "opacity" && bottomRightLogs.classList.contains("is-fading") && !logsAreHovered) {
+                bottomRightLogs.classList.add("is-faded");
+            }
+        });
+
+        bottomRightLogs.addEventListener("mouseenter", () => {
+            logsAreHovered = true;
+            clearTimeout(hideLogsTimer);
+            bottomRightLogs.classList.add("is-hovered");
+            bottomRightLogs.classList.remove("is-fading");
+        });
+
+        bottomRightLogs.addEventListener("mouseleave", () => {
+            logsAreHovered = false;
+            bottomRightLogs.classList.remove("is-hovered");
+            if (!bottomRightLogs.classList.contains("is-faded")) {
+                resetLogFade();
+            }
+        });
+
+        closeLogs.addEventListener("click", () => {
+            clearTimeout(hideLogsTimer);
+            bottomRightLogs.style.display = "none";
+            bottomRightLogs.classList.remove("is-hovered");
+            bottomRightLogs.classList.remove("is-fading");
+            bottomRightLogs.classList.remove("is-faded");
+        });
 
         function showError(msg) {
             errorDisplay.style.display = "flex";
@@ -174,12 +256,15 @@
             } else {
                 // the canvas is visible, put logs in the small bottom-right overlay
                 bottomRightLogs.style.display = "block"; // Make sure it's visible
+                bottomRightLogs.classList.remove("is-faded");
+                resetLogFade();
                 bottomRightLogs.appendChild(logLine);
                 bottomRightLogs.scrollTop = bottomRightLogs.scrollHeight;
+                logLine.className = "log-line";
 
                 // keep log history bounded to avoid high memory/DOM usage
-                while (bottomRightLogs.childElementCount > 150) {
-                    bottomRightLogs.removeChild(bottomRightLogs.firstChild);
+                while (bottomRightLogs.querySelectorAll(".log-line").length > 150) {
+                    bottomRightLogs.removeChild(bottomRightLogs.querySelector(".log-line"));
                 }
             }
         }
