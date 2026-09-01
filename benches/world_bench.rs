@@ -1,5 +1,5 @@
 use criterion::{Criterion, criterion_group, criterion_main};
-use path_tracer::render::scene::Scene;
+use path_tracer::render::world::Scene;
 use std::hint::black_box;
 
 fn benchmark_scene_loading(c: &mut Criterion) {

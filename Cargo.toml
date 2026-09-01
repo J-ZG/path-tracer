@@ -25,7 +25,7 @@ testing = [
 ]
 
 [[bench]]
-name = "scene_bench"
+name = "world_bench"
 harness = false
 bench = false        # so code in benches/ doesn't error when working with wasm32
 
@@ -73,7 +73,7 @@ image = { version = "0.25.10", default-features = false, features = [
 bytemuck = { version = "1.25.2", default-features = false, features = [
     "derive",
 ] }
-glam = { version = "0.33.5", default-features = false, features = [
+glam = { version = "0.33.6", default-features = false, features = [
     "std",
     "all-types",
     "bytemuck",
@@ -125,7 +125,7 @@ env_logger = { version = "0.11.11", default-features = false, features = [
 serde = { version = "1.0.229", default-features = false, features = [
     "derive",
 ], optional = true }
-serde-saphyr = { version = "1.1.0", default-features = false, features = [
+serde-saphyr = { version = "1.2.0", default-features = false, features = [
     "serialize",
 ], optional = true }
 wgpu-profiler = { version = "0.27.0", default-features = false, features = [

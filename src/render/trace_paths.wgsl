@@ -11,7 +11,7 @@ const LUMA_COEFFICIENTS = vec3f(0.2126, 0.7152, 0.0722); // standard Rec. 709 co
 // which is the unit OpenPBR specifies for emission_luminance
 // since nits = cd/m^2, this also implies that world position coordinate unit in this path tracer is actually meters
 
-// change EXPOSURE below to make scenes look properly exposed
+// change EXPOSURE below to make worlds look properly exposed
 // don't change, for example, sky_color (it's physically accurate for a clear sky to be 8000 nits)
 // in other words: don't cheat the lighting; only change the camera
 
@@ -20,7 +20,7 @@ const LUMA_COEFFICIENTS = vec3f(0.2126, 0.7152, 0.0722); // standard Rec. 709 co
 // EV100 = log2((aperture^2 * 100) / (shutter_speed * iso)) ≈ 14.9657842847
 // max_luminance = 1.2 * 2^(EV100) = 38400
 // EXPOSURE = 1 / max_luminance ≈ 0.00002604166
-// also, EXPOSURE = 0.001 can come from approximately aperture 4, shutter speed 1/50, iso 100; typical for indoor scenes
+// also, EXPOSURE = 0.001 can come from approximately aperture 4, shutter speed 1/50, iso 100; typical for indoor worlds
 const EXPOSURE = 0.00002604166;
 // TODO: implement and allow the user to adjust (can be stored in Camera struct):
 // - aperture: enables depth of field
@@ -128,25 +128,12 @@ struct Camera {
 // https://www.pcg-random.org/index.html
 // TODO: low-discrepancy sequences and blue noise are better
 var<private> rng_state = 0u;
-fn seed_rand(invocation_id: vec3u, frame_count: u32) {
-    rng_state = (invocation_id.x * 0x9E3779B9u)
-      ^ (invocation_id.y * 0x85EBCA6Bu)
-      ^ (invocation_id.z * 0xC2B2AE35u)
-      ^ (frame_count * 0x27D4EB2Du)
-      ^ 0xA511E9B3u;
-
-    rng_state |= 1u;
-}
-fn pcg_next_u32() -> u32 {
-    rng_state = rng_state * 747796405u + 2891336453u;
-    let word = ((rng_state >> ((rng_state >> 28u) + 4u)) ^ rng_state) * 277803737u;
-    return (word >> 22u) ^ word;
-}
 // returns random f32 ∈ [0, 1)
 // even with multiple rand() calls after the same seed_rand, each call still produces a different random value
 fn rand() -> f32 {
-    let bits = pcg_next_u32() >> 9u;
-    return bitcast<f32>(0x3f800000u | bits) - 1.0;
+    rng_state = rng_state * 747796405u + 2891336453u;
+    let word = ((rng_state >> ((rng_state >> 28u) + 4u)) ^ rng_state) * 277803737u;
+    return bitcast<f32>(0x3f800000u | (((word >> 22u) ^ word) >> 9u)) - 1.0;
 }
 
 fn fifth_power(x: f32) -> f32 {
@@ -238,7 +225,7 @@ fn sample_lobes(
     let b = ltc_coefficients.y;
     let c = ltc_coefficients.z;
     let d = ltc_coefficients.w;
-    let detM = c * (a - b * d);
+    let detM = c * fma(-b, d, a);
     let wh = vec3f(c * (wi_LTC.x - b * wi_LTC.z), (a - b * d) * wi_LTC.y, -c * (d * wi_LTC.x - a * wi_LTC.z));
     let lenSqr = dot(wh, wh);
     let s_pdf = fma(0.5, inverseSqrt(fma(d, d, 1.0)), 0.5);
@@ -358,13 +345,8 @@ fn intersect_aabb(node: BvhNode, neg_ray_origin_div_direction: vec3<f32>, ray_di
     let t_near = max(max(tmin.x, tmin.y), tmin.z);
     let t_far = min(min(tmax.x, tmax.y), tmax.z);
 
-    // if the ray hits the aabb and it's closer than hit_t
-    if t_near <= t_far && t_far > 0.0 && t_near < hit_t {
-        // max(0.0, t_near) ensures that if the camera is inside the AABB, returns distance 0 instead of a negative value
-        return max(0.0, t_near);
-    }
-
-    return -1.0; // missed
+    // if the ray hits the aabb and it's closer than hit_t, return max(0.0, t_near), which ensures that if the camera is inside the AABB, returns distance 0 instead of a negative value
+    return select(-1.0, max(0.0, t_near), t_near <= t_far && t_far > 0.0 && t_near < hit_t);
 }
 
 @compute @workgroup_size(8, 8, 1)
@@ -379,7 +361,13 @@ fn compute_main(@builtin(global_invocation_id) global_id: vec3u) {
         return;
     }
 
-    seed_rand(global_id, frame_count);
+    // seed the random number generator
+    rng_state = (global_id.x * 0x9E3779B9u)
+      ^ (global_id.y * 0x85EBCA6Bu)
+      ^ (global_id.z * 0xC2B2AE35u)
+      ^ (frame_count * 0x27D4EB2Du)
+      ^ 0xA511E9B3u;
+    rng_state |= 1u;
 
     // convert the x and y on the texture/surface to normalized values between 0 and 1
     // + vec2f with rand() enables subpixel jitter for anti-aliasing (TAA)
@@ -425,8 +413,14 @@ fn compute_main(@builtin(global_invocation_id) global_id: vec3u) {
         let Sx = -ray_direction[kx] * Sz;
         let Sy = -ray_direction[ky] * Sz;
 
+        // note that refactoring the following traversal out into a separate function can drastically change performance
+        // performance seems to be worsened no matter if the function returns a struct or it takes ptr<function, f32 or i32> for hit_t hit_index hit_v hit_w
+
+        // also, changing stack size in a refactored function vs. inline produces different results
+        // for example, in function, size of 64 produces 17 FPS while size of 128 surprisingly produces 46 FPS; inlined, 64 vs 128 produce same 53 FPS
+
         // setup fixed-size stack for BVH traversal (depth 64 is sufficient for millions of triangles)
-        var stack: array<u32, 64>; // TODO: investigate if 64 can be set dynamically
+        var stack: array<u32, 64>; // TODO: try stackless
 
         // push root node
         stack[0] = 0u;
@@ -580,7 +574,7 @@ fn compute_main(@builtin(global_invocation_id) global_id: vec3u) {
         var specular_color = mat.specular_color_and_weight.rgb;
         var specular_weight = mat.specular_color_and_weight.a;
         let specular_roughness = mat.specular_roughness;
-        let specular_roughness_anisotropy = mat.specular_roughness_anisotropy;
+        let specular_roughness_anisotropy = mat.specular_roughness_anisotropy; // TODO: investigate how anisotropy actually works; should there be a parameter for the direction of anisotropy? OpenPBR doesn't specify it
         // let specular_haze = mat.specular_haze;
         // let specular_haze_spread = mat.specular_haze_spread;
         let specular_ior = mat.specular_ior;
@@ -937,12 +931,8 @@ fn compute_main(@builtin(global_invocation_id) global_id: vec3u) {
 
     // frame_count resets to 0 when the camera moves, but the increment happens after the reset, so frame count can never be zero in the shader
     // only from the second frame onward can we be sure that the accumulation buffer has valid data to blend with
-    var accumulated = vec3f(0.0);
-    if frame_count > 1u {
-        accumulated = accumulation_buffer[pixel_index].rgb;
-    }
+    let accumulated = select(vec3f(0.0), accumulation_buffer[pixel_index].rgb, frame_count > 1u) + final_color;
 
-    accumulated += final_color;
     accumulation_buffer[pixel_index] = vec4f(accumulated, 1.0);
 
     // average out result

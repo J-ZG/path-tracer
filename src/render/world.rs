@@ -1,4 +1,5 @@
-//! Load, format, and manage a 3D scene from a glTF 2.0 .glb file.
+//! Load, format, and manage a 3D world from a glTF 2.0 .glb file.
+// the terminology is: world = scene + skybox
 
 // it's all pub instead of pub(crate) in this module because criterion, an external crate, is used to benchmark stuff in this module
 
@@ -891,6 +892,8 @@ impl Scene {
     /// Recursive binned surface area heuristic subdivider.
     ///
     /// The current target [`GpuBvhNode`] is `nodes[node_index]`, and `bvh_triangles[start..end]` are the triangles this node spans.
+    // TODO: look into BVH again. Spacial splits (SBVH)? Spatial-partitioning (like KD trees) is rarely used in modern path tracers, but are KD trees really worse?
+    // Also, UBVH https://dcgi.fel.cvut.cz/en/publications/2025/kaceric-cgf-ubvh/, wide BVH, and better heuristic than SAH
     fn subdivide(
         node_index: usize,
         nodes: &mut Vec<GpuBvhNode>,
@@ -1055,7 +1058,7 @@ impl Scene {
     }
 
     /// Get the scene data that [`Scene::new()`] originally generated.
-    // there's a getter rather than a direct pub field access because we want to make sure that Initial isn't modified outside of Scene
+    // there's a getter rather than a direct pub field access because we want to make sure that Initial isn't modified outside of this module
     pub const fn initial(&self) -> &Initial {
         &self.initial
     }

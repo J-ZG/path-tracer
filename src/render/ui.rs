@@ -2,7 +2,7 @@
 //!
 //! Only used within [`crate::State::new()`] and [`crate::State::update()`].
 
-use super::scene;
+use super::world;
 
 /// Define the look of the UI.
 pub fn style() -> egui::Style {
@@ -120,7 +120,7 @@ fn key_label(ui: &mut egui::Ui, text: &str) {
     .show(ui, |ui| ui.monospace(text));
 }
 
-/// What the user is doing in the UI, which [`run_base()`] returns.
+/// What the user is doing in the base UI, which [`run_base()`] returns.
 pub enum BaseUiAction {
     UploadScene,
     UploadSkybox,
@@ -134,8 +134,8 @@ pub enum BaseUiAction {
 /// `upload_status`, if not empty, is displayed below the buttons for uploading files.
 pub fn run_base(
     root_ui: &egui::Ui,
-    scene: &mut scene::Scene,
-    skybox: &mut scene::Skybox,
+    scene: &mut world::Scene,
+    skybox: &mut world::Skybox,
     dt: f32,
     frame_count: u32,
     upload_status: &str,
@@ -202,7 +202,7 @@ pub fn run_base(
                     let separator_y = ui.cursor().top();
                     ui.add_space(ui.spacing().item_spacing.y * 2.0);
 
-                    ui.collapsing("Scene", |ui| {
+                    ui.collapsing("World", |ui| {
                         if ui.button("Upload scene").clicked() {
                             actions.push(BaseUiAction::UploadScene);
                         }
@@ -378,18 +378,25 @@ pub fn run_base(
     actions
 }
 
+/// What the user is doing in the modify material UI, which [`run_modify_material()`] returns.
+pub enum ModifyMaterialUiAction {
+    Unmodified,
+    Modified { emission_modified: bool },
+}
+
 /// Run the UI for modifying a material. Should be called inside the closure for [`egui::Context::run_ui()`].
 ///
-/// `material_index` should come from [`scene::Scene::takeout_gpu_camera()`] unwrapped.
+/// `material_index` should come from [`world::Scene::takeout_gpu_camera()`] unwrapped.
 ///
 /// Returns whether the user modified the material through this UI.
-/// When `true` is returned, the user modified the material at the `material_index` index in [`scene::Scene::materials`], so this material has changed in [`scene::Scene`] already (as this function takes `&mut` to [`scene::Scene`]).
+/// When `true` is returned, the user modified the material at the `material_index` index in [`world::Scene::materials`], so this material has changed in [`world::Scene`] already (as this function takes `&mut` to [`world::Scene`]).
 pub fn run_modify_material(
     root_ui: &egui::Ui,
-    scene: &mut scene::Scene,
+    scene: &mut world::Scene,
     material_index: usize,
-) -> bool {
+) -> ModifyMaterialUiAction {
     let mut mat_changed = false;
+    let mut emission_modified = false;
 
     egui::Window::new(format!("Material {material_index}"))
         .id(egui::Id::new("Material Properties"))
@@ -557,26 +564,35 @@ pub fn run_modify_material(
                 "Specular Retroreflectivity",
             );
 
-            mat_changed |= mat_slider(
+            let emission_weight_changed = mat_slider(
                 ui,
                 &mut mat.OpenPBR_emission_weight,
                 initial_mat.OpenPBR_emission_weight,
                 0.0..=1.0,
                 "Emission Weight",
             );
-            mat_changed |= mat_slider(
+            mat_changed |= emission_weight_changed;
+            emission_modified |= emission_weight_changed;
+
+            let emission_luminance_changed = mat_slider(
                 ui,
                 &mut mat.emission_color_and_strength.w,
                 initial_mat.emission_color_and_strength.w,
                 0.0..=1_500_000.0,
                 "Emission Luminance (nits)",
             );
-            mat_changed |= color_rgb(
+            mat_changed |= emission_luminance_changed;
+            emission_modified |= emission_luminance_changed;
+
+            let emission_color_changed = color_rgb(
                 ui,
                 &mut mat.emission_color_and_strength,
                 initial_mat.emission_color_and_strength,
                 "Emission Color",
             );
+            mat_changed |= emission_color_changed;
+            emission_modified |= emission_color_changed;
+
             mat_changed |= mat_slider(
                 ui,
                 &mut mat.normal_scale,
@@ -586,5 +602,9 @@ pub fn run_modify_material(
             );
         });
 
-    mat_changed
+    if mat_changed {
+        ModifyMaterialUiAction::Modified { emission_modified }
+    } else {
+        ModifyMaterialUiAction::Unmodified
+    }
 }
