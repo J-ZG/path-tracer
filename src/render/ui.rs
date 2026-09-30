@@ -337,7 +337,7 @@ pub fn run_base(
 
                     if github_button_response.clicked() {
                         ui.ctx().open_url(egui::OpenUrl::same_tab(
-                            "https://github.com/0dpe/path-tracer",
+                            "https://github.com/j-zg/path-tracer",
                         ));
                     }
 

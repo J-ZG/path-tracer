@@ -1,11 +1,11 @@
-# [path-tracer](https://0dpe.github.io/path-tracer/)
+# [path-tracer](https://j-zg.github.io/path-tracer/)
 
 <p align="center">
-    <img src="https://raw.githubusercontent.com/0dpe/path-tracer/main/doc/cornell.jpg" height="200em">
-    <img src="https://raw.githubusercontent.com/0dpe/path-tracer/main/doc/cornell_torus.jpg" height="200em">
+    <img src="https://raw.githubusercontent.com/j-zg/path-tracer/main/doc/cornell.jpg" height="200em">
+    <img src="https://raw.githubusercontent.com/j-zg/path-tracer/main/doc/cornell_torus.jpg" height="200em">
 </p>
 <p align="center">
-    <img src="https://raw.githubusercontent.com/0dpe/path-tracer/main/doc/infinite_mirrors.jpg" height="180em">
+    <img src="https://raw.githubusercontent.com/j-zg/path-tracer/main/doc/infinite_mirrors.jpg" height="180em">
 </p>
 
 A demo real-time 3D path tracer built with WebGPU ([wgpu](https://github.com/gfx-rs/wgpu)) and Rust, implementing modern rendering techniques.
@@ -22,7 +22,7 @@ A demo real-time 3D path tracer built with WebGPU ([wgpu](https://github.com/gfx
 Install [Rust](https://rustup.rs/ "rustup") and clone this repository:
 
 ```bash
-git clone https://github.com/0dpe/path-tracer.git
+git clone https://github.com/j-zg/path-tracer.git
 cd path-tracer
 ```
 
@@ -78,7 +78,7 @@ path-tracer/
 * `cargo t`: Run with `testing` feature enabled, allowing more debug information to be outputted during running (which may significantly worsen performance). **Broken on macOS due to issue with Tracy, see [Wumpf/wgpu-profiler](https://github.com/Wumpf/wgpu-profiler/issues/107).** `testing` feature is only supported on native, since debug output files are saved to disk, in `debug_output/` (which is gitignored). If there are errors during build related to C++, it's often because build tools are missing; one option is to install them through [Build Tools for Visual Studio](https://visualstudio.microsoft.com/downloads/#build-tools-for-visual-studio-2026). Profiling with Tracy is supported:
     1. Download [Tracy](https://github.com/wolfpld/tracy/releases/).
     1. Have the Tracy profiler open while path-tracer is running. path-tracer-app should appear under the discovered clients.
-* `cargo bench --bench filename -- function`: Run a benchmark. `filename` is a filename in [`benches/`](https://github.com/0dpe/path-tracer/tree/main/benches), and `function` is the ID of a `bench_function`. Criterion is used; view the detailed benchmark reports at `target/criterion/report/index.html`.
+* `cargo bench --bench filename -- function`: Run a benchmark. `filename` is a filename in [`benches/`](https://github.com/j-zg/path-tracer/tree/main/benches), and `function` is the ID of a `bench_function`. Criterion is used; view the detailed benchmark reports at `target/criterion/report/index.html`.
 * `cargo doc --open --document-private-items --no-deps --target wasm32-unknown-unknown`: Generate and view the documentation.
 
 To see a translated WGSL shader, use `naga-cli`:
@@ -90,4 +90,4 @@ naga input.wgsl output.hlsl # or .metal or .spv
 
 For SPIR-V specifically, `spirv-dis` can be installed from [LunarG](https://vulkan.lunarg.com/sdk/home#) if it's missing, and can be used to convert binary to readable text: `spirv-dis output.spv -o output_readable.txt`.
 
-Tracing with [NVIDIA Nsight](https://developer.nvidia.com/nsight-systems/get-started) works; just copy [`assets/`](https://github.com/0dpe/path-tracer/tree/main/assets) to the same directory as the executable (in `target/release/`).
+Tracing with [NVIDIA Nsight](https://developer.nvidia.com/nsight-systems/get-started) works; just copy [`assets/`](https://github.com/j-zg/path-tracer/tree/main/assets) to the same directory as the executable (in `target/release/`).

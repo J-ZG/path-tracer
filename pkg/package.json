@@ -6,7 +6,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/0dpe/path-tracer"
+    "url": "https://github.com/j-zg/path-tracer"
   },
   "files": [
     "path_tracer_bg.wasm",

@@ -2,15 +2,15 @@
 //!
 //! Includes methods for initializing these resources and handling events from the window.
 
-/// The name of the glTF 2.0 .glb file to load from the [`assets/glb/`](https://github.com/0dpe/path-tracer/tree/main/assets/glb) directory to render by default.
+/// The name of the glTF 2.0 .glb file to load from the [`assets/glb/`](https://github.com/j-zg/path-tracer/tree/main/assets/glb) directory to render by default.
 ///
 /// Can be exported from Blender.
-/// ![Export glTF from Blender 1](https://raw.githubusercontent.com/0dpe/path-tracer/main/doc/blender_export_gltf_1.jpg)
-/// ![Export glTF from Blender 2](https://raw.githubusercontent.com/0dpe/path-tracer/main/doc/blender_export_gltf_2.jpg)
+/// ![Export glTF from Blender 1](https://raw.githubusercontent.com/j-zg/path-tracer/main/doc/blender_export_gltf_1.jpg)
+/// ![Export glTF from Blender 2](https://raw.githubusercontent.com/j-zg/path-tracer/main/doc/blender_export_gltf_2.jpg)
 /// Be sure to check `Include > Custom Properties` and `Mesh > Apply Modifiers`.
 const DEFAULT_SCENE: &str = "box.glb";
 
-/// The name of the skybox file to load from the [`assets/skybox/`](https://github.com/0dpe/path-tracer/tree/main/assets/skybox) directory to render by default.
+/// The name of the skybox file to load from the [`assets/skybox/`](https://github.com/j-zg/path-tracer/tree/main/assets/skybox) directory to render by default.
 const DEFAULT_SKYBOX: &str = "kloppenheim_06_puresky_2k.hdr"; // https://polyhaven.com/a/kloppenheim_06_puresky
 
 /// Supported file extensions for the scene.
@@ -87,7 +87,7 @@ pub struct State {
     /// Whether to show the UI overlay.
     show_ui: bool,
 
-    /// Whether a frame has been presented, so that the loading screen in [`index.html`](https://github.com/0dpe/path-tracer/blob/main/index.html) can be dismissed once.
+    /// Whether a frame has been presented, so that the loading screen in [`index.html`](https://github.com/j-zg/path-tracer/blob/main/index.html) can be dismissed once.
     #[cfg(target_arch = "wasm32")]
     presented_first_frame: bool,
 

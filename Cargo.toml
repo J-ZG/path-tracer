@@ -4,7 +4,7 @@ version = "0.1.0"
 resolver = "3"
 edition = "2024"
 description = "Demo Rust wgpu interactive path tracer."
-repository = "https://github.com/0dpe/path-tracer"
+repository = "https://github.com/j-zg/path-tracer"
 readme = "README.md"
 license = "MIT"
 
