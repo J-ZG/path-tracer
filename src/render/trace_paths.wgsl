@@ -7,7 +7,8 @@ const INV_2PI = 0.15915494309189535;
 const LUMA_COEFFICIENTS = vec3f(0.2126, 0.7152, 0.0722); // standard Rec. 709 coefficients to convert RGB -> luminance value
 
 // this path tracer works in photometric units
-// (linear) RGB values like final_color, sky_color, and values in accumulation_buffer, are luminance values measured in nits,
+// note that radiometric and photometric units follow the same mathematical laws, meaning this path tracer can operate directly in photometric units while using the radiometric lighting equations
+// many RGB values like final_color, sky_color, and values in accumulation_buffer are luminance values, each channel measured in nits,
 // which is the unit OpenPBR specifies for emission_luminance
 // since nits = cd/m^2, this also implies that world position coordinate unit in this path tracer is actually meters
 
@@ -635,13 +636,8 @@ fn compute_main(@builtin(global_invocation_id) global_id: vec3u) {
             emission_color *= emission_tex.rgb; // alpha channel ignored per glTF spec; OpenPBR also doesn't specify alpha channel for emission color
         }
 
-        // emission_color is only a hue while emission_luminance is the actual luminance in nits;
-        // normalize emission_color so its luminance is 1.0 before using it for final_color
-        // this makes tweaking the emission_color artistically slightly unintuitive, but ensures that emission_luminance is the actual final luminance of the material
-        let emission_color_luminance = dot(emission_color, LUMA_COEFFICIENTS);
-        if emission_color_luminance > 0.0 {
-            final_color += throughput * emission_weight * emission_luminance * emission_color / emission_color_luminance;
-        }
+        // not dividing by dot(emission_color, LUMA_COEFFICIENTS) because OpenPBR did not specify that
+        final_color += throughput * emission_weight * emission_luminance * emission_color;
 
         let V = -ray_direction; // view vector, going from the surface to the camera expressed in world space
 

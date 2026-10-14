@@ -16,7 +16,6 @@ pub const ATLAS_SIZE: u32 = 8192;
 
 // TODO: fix transparency in textures; parsing is done correctly, but shader is not correct. also, in gltf::material, parse alpha_mode and alpha_cutoff to do this properly
 // TODO: add vertex colors
-// TODO: wasm32 build failing due to bug in egui-winit 30, also version 30 greatly worsened performance
 // TODO: there are lag spikes (not related to wgpu version 30), occurring at set amount of time elapsed after application first runs, which slows down frame rate by some percentage (not absolute change in frame rate)
 // TODO: render at a smaller resolution by default (maybe by somehow running an auto benchmark before anything runs to determine the user's hardware capabilities), and allow user to adjust resolution, so the app doesn't crash the user's computer
 
@@ -433,14 +432,18 @@ impl Scene {
                 Format::R8G8 => rgba.extend(
                     image
                         .pixels
-                        .chunks_exact(2)
-                        .flat_map(|rg| [rg[0], rg[1], 0, 255]),
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .flat_map(|&[r, g]| [r, g, 0, 255]),
                 ),
                 Format::R8G8B8 => rgba.extend(
                     image
                         .pixels
-                        .chunks_exact(3)
-                        .flat_map(|rgb| [rgb[0], rgb[1], rgb[2], 255]),
+                        .as_chunks::<3>()
+                        .0
+                        .iter()
+                        .flat_map(|&[r, g, b]| [r, g, b, 255]),
                 ),
                 Format::R8G8B8A8 => rgba.extend(image.pixels.iter().copied()),
 
@@ -448,25 +451,33 @@ impl Scene {
                 Format::R16 => rgba.extend(
                     image
                         .pixels
-                        .chunks_exact(2)
-                        .flat_map(|r| [r[1], r[1], r[1], 255]),
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .flat_map(|&[_, g]| [g, g, g, 255]),
                 ),
                 Format::R16G16 => rgba.extend(
                     image
                         .pixels
-                        .chunks_exact(4)
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
                         .flat_map(|rg| [rg[1], rg[3], 0, 255]),
                 ),
                 Format::R16G16B16 => rgba.extend(
                     image
                         .pixels
-                        .chunks_exact(6)
+                        .as_chunks::<6>()
+                        .0
+                        .iter()
                         .flat_map(|rgb| [rgb[1], rgb[3], rgb[5], 255]),
                 ),
                 Format::R16G16B16A16 => rgba.extend(
                     image
                         .pixels
-                        .chunks_exact(8)
+                        .as_chunks::<8>()
+                        .0
+                        .iter()
                         .flat_map(|rgba| [rgba[1], rgba[3], rgba[5], rgba[7]]),
                 ),
                 _ => {
@@ -671,7 +682,7 @@ impl Scene {
                             }
 
                             if !use_computed_tangents {
-                                for chunk in temp_prim_indices.chunks_exact(3) {
+                                for chunk in temp_prim_indices.as_chunks::<3>().0 {
                                     let w0 = temp_prim_tangents[chunk[0] as usize].w;
                                     let w1 = temp_prim_tangents[chunk[1] as usize].w;
                                     let w2 = temp_prim_tangents[chunk[2] as usize].w;
@@ -690,7 +701,7 @@ impl Scene {
                         // if normals are not given, generate flat normals
                         // don't even bother trying to parse tangents, since glTF states that if normals aren't given but tangents are, the given tangents should be ignored
                         temp_prim_normals.resize(temp_prim_positions.len(), glam::Vec3::ZERO);
-                        for chunk in temp_prim_indices.chunks_exact(3) {
+                        for chunk in temp_prim_indices.as_chunks::<3>().0 {
                             let [i0, i1, i2] =
                                 [chunk[0] as usize, chunk[1] as usize, chunk[2] as usize];
                             let n = (temp_prim_positions[i1] - temp_prim_positions[i0])
@@ -747,7 +758,7 @@ impl Scene {
                         new_index
                     };
 
-                    for (tri, chunk) in temp_prim_indices.chunks_exact(3).enumerate() {
+                    for (tri, chunk) in temp_prim_indices.as_chunks::<3>().0.iter().enumerate() {
                         let [i0, i1, i2] =
                             [chunk[0] as usize, chunk[1] as usize, chunk[2] as usize];
 
@@ -1148,16 +1159,16 @@ impl Scene {
                     let b = (tri.v1 - self.camera.position).to_array();
                     let c = (tri.v2 - self.camera.position).to_array();
 
-                    let ax = sx * a[kz] + a[kx];
-                    let ay = sy * a[kz] + a[ky];
-                    let bx = sx * b[kz] + b[kx];
-                    let by = sy * b[kz] + b[ky];
-                    let cx = sx * c[kz] + c[kx];
-                    let cy = sy * c[kz] + c[ky];
+                    let ax = sx.mul_add(a[kz], a[kx]);
+                    let ay = sy.mul_add(a[kz], a[ky]);
+                    let bx = sx.mul_add(b[kz], b[kx]);
+                    let by = sy.mul_add(b[kz], b[ky]);
+                    let cx = sx.mul_add(c[kz], c[kx]);
+                    let cy = sy.mul_add(c[kz], c[ky]);
 
-                    let u = cx * by - cy * bx;
-                    let v = ax * cy - ay * cx;
-                    let w = bx * ay - by * ax;
+                    let u = cy.mul_add(-bx, cx * by);
+                    let v = ay.mul_add(-cx, ax * cy);
+                    let w = by.mul_add(-ax, bx * ay);
 
                     if u.min(v.min(w)) < 0.0 && u.max(v.max(w)) > 0.0 {
                         continue;
@@ -1388,7 +1399,7 @@ impl Skybox {
                 // standard Rec. 709 coefficients to convert RGB -> luminance value
 
                 max_luma = max_luma.max(luma);
-                total_luma += luma * weight;
+                total_luma = f32::mul_add(luma, weight, total_luma);
                 total_weight += weight;
             }
         }
@@ -1435,7 +1446,7 @@ impl Skybox {
                 // because pixels are scaled, the mean is exactly 1.0
                 // variance is the squared difference from the mean
                 let diff = scaled_luma - 1.0;
-                variance_sum += (diff * diff) * weight;
+                variance_sum = f32::mul_add(diff * diff, weight, variance_sum);
             }
         }
 

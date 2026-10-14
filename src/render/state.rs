@@ -172,8 +172,7 @@ impl State {
             desired_maximum_frame_latency: 2,
             alpha_mode: wgpu::CompositeAlphaMode::Auto,
             view_formats: vec![wgpu::TextureFormat::Bgra8Unorm],
-            // TODO: 30
-            // color_space: wgpu::SurfaceColorSpace::Auto,
+            color_space: wgpu::SurfaceColorSpace::Auto,
         };
 
         let adapter = instance
@@ -181,8 +180,7 @@ impl State {
                 power_preference: wgpu::PowerPreference::HighPerformance,
                 compatible_surface: Some(&surface),
                 force_fallback_adapter: false,
-                // TODO: 30
-                // apply_limit_buckets: false,
+                apply_limit_buckets: false,
             })
             .await?;
 
@@ -1070,43 +1068,36 @@ impl State {
 
                 // allow the user to drag and drop a scene or skybox
                 // TODO: doesn't work on wasm32 at all, even when browser default drag and drop behavior is disabled; probably requires complex fix
-                let mut dropped_glb = None;
-                let mut dropped_skybox = None;
-
                 for file in &raw_input.dropped_files {
-                    if let Some(ext) = file
-                        .path
-                        .as_deref()
-                        .unwrap_or_else(|| std::path::Path::new(&file.name))
-                        .extension()
-                        .and_then(|e| e.to_str())
-                        .map(str::to_lowercase)
-                    {
-                        let is_scene = SCENE_EXTS.contains(&ext.as_str());
-                        let is_skybox = SKYBOX_EXTS.contains(&ext.as_str());
-
-                        if (is_scene || is_skybox)
-                            && let Some(bytes) =
-                                file.bytes.as_ref().map(|b| b.to_vec()).or_else(|| {
-                                    file.path.as_ref().and_then(|p| std::fs::read(p).ok())
-                                })
-                        {
-                            if is_scene {
-                                dropped_glb = Some(bytes);
-                            } else if is_skybox {
-                                dropped_skybox = Some(bytes);
-                            }
-                        }
+                    let Some(ext) = file.path().extension().and_then(|e| e.to_str()) else {
+                        continue;
+                    };
+                    let ext = ext.to_lowercase();
+                    let is_scene = SCENE_EXTS.contains(&ext.as_str());
+                    if !is_scene && !SKYBOX_EXTS.contains(&ext.as_str()) {
+                        continue;
                     }
-                }
-
-                if let Some(bytes) = dropped_glb {
-                    // note that updating self.file_upload_status here is redundant since only one file_upload_status can be shown per frame (each frame is an entire execution of update()),
-                    // and while dropping a file and loading it (see self.file_receiver.try_recv() below) happens in this same frame, self.file_upload_status is overridden later on
-                    let _ = self.file_sender.send(UploadedFile::Scene(bytes));
-                }
-                if let Some(bytes) = dropped_skybox {
-                    let _ = self.file_sender.send(UploadedFile::Skybox(bytes));
+                    let sender = self.file_sender.clone();
+                    let send_bytes = move |result: Result<Vec<u8>, String>| match result {
+                        Ok(bytes) => {
+                            let upload = if is_scene {
+                                UploadedFile::Scene(bytes)
+                            } else {
+                                UploadedFile::Skybox(bytes)
+                            };
+                            let _ = sender.send(upload);
+                        }
+                        Err(error) => log::error!("Failed to read dropped file: {error}"),
+                    };
+                    #[cfg(not(target_arch = "wasm32"))]
+                    send_bytes(file.bytes());
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        let file = std::sync::Arc::clone(file);
+                        wasm_bindgen_futures::spawn_local(async move {
+                            send_bytes(file.bytes_async().await);
+                        });
+                    }
                 }
 
                 let is_hovering = !raw_input.hovered_files.is_empty();
@@ -1266,25 +1257,16 @@ impl State {
                     .handle_platform_output(&self.window, platform_output);
 
                 // must be called before egui_wgpu_renderer.render()
-                for (id, image_delta) in &full_output.textures_delta.set {
-                    self.egui_wgpu_renderer.update_texture(
-                        &self.device,
-                        &self.queue,
-                        *id,
-                        image_delta,
-                    );
+                for (id, image_deltas) in &full_output.textures_delta.set {
+                    for image_delta in image_deltas {
+                        self.egui_wgpu_renderer.update_texture(
+                            &self.device,
+                            &self.queue,
+                            *id,
+                            image_delta,
+                        );
+                    }
                 }
-                // TODO: 30
-                // for (id, image_deltas) in &full_output.textures_delta.set {
-                //     for image_delta in image_deltas {
-                //         self.egui_wgpu_renderer.update_texture(
-                //             &self.device,
-                //             &self.queue,
-                //             *id,
-                //             image_delta,
-                //         );
-                //     }
-                // }
 
                 // used for both egui_wgpu_renderer.update_buffers() and egui_wgpu_renderer.render()
                 let screen_descriptor = egui_wgpu::ScreenDescriptor {
@@ -1430,9 +1412,7 @@ impl State {
                 // might only matter on Wayland
                 self.window.pre_present_notify();
 
-                frame.present();
-                // TODO: 30
-                // self.queue.present(frame);
+                self.queue.present(frame);
 
                 // the first proper frame is presented, so there is something on the canvas on the web,
                 // so the loading screen in index.html can fade out
