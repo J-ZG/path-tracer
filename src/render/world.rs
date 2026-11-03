@@ -1,7 +1,7 @@
 //! Load, format, and manage a 3D world from a glTF 2.0 .glb file.
 // the terminology is: world = scene + skybox
 
-// it's all pub instead of pub(crate) in this module because criterion, an external crate, is used to benchmark stuff in this module
+// some are pub instead of pub(super) or pub(crate) in this module because criterion, an external crate, is used to benchmark stuff in this module
 
 use anyhow::Context;
 
@@ -11,7 +11,7 @@ use anyhow::Context;
 /// Since passing an array of images with different sizes isn't supported universally,
 /// images are packed into atlases which are larger square images that store multiple smaller images.
 /// Then, an array of atlases are passed to the GPU without problems.
-pub const ATLAS_SIZE: u32 = 8192;
+pub(super) const ATLAS_SIZE: u32 = 8192;
 // TODO: could be sized dynamically: after atlas construction, if there was only one atlas, shrink the atlas until it fits; there are multiple atlases, just use 8192
 
 // TODO: fix transparency in textures; parsing is done correctly, but shader is not correct. also, in gltf::material, parse alpha_mode and alpha_cutoff to do this properly
@@ -19,68 +19,88 @@ pub const ATLAS_SIZE: u32 = 8192;
 // TODO: there are lag spikes (not related to wgpu version 30), occurring at set amount of time elapsed after application first runs, which slows down frame rate by some percentage (not absolute change in frame rate)
 // TODO: render at a smaller resolution by default (maybe by somehow running an auto benchmark before anything runs to determine the user's hardware capabilities), and allow user to adjust resolution, so the app doesn't crash the user's computer
 
-/// Contains all the data loaded from a glTF 2.0 .glb file, formatted for the GPU.
+// TODO: finish docs
+
+// structs are named Gpu* iff it's intended that they get directly put into bytemuck::bytes_of for the GPU
+
+/// Contains world data and pending changes.
+pub(super) struct World {
+    scene: Scene,
+    skybox: Skybox,
+    scene_id: std::rc::Rc<()>,
+    pending: PendingChanges,
+    scene_uniforms: GpuSceneUniforms,
+    scene_alias_table: Vec<GpuSceneAliasEntry>,
+    selected_material: Option<usize>,
+}
+
+/// Used for internally keeping track of desired changes since the last [`World::take_updates()`] call.
+#[derive(Default)]
+struct PendingChanges {
+    scene: Option<(Scene, std::rc::Rc<()>)>,
+    skybox: Option<Skybox>,
+    camera: Option<Camera>,
+    skybox_average_luminance: Option<f32>,
+    materials: std::collections::BTreeMap<usize, GpuMaterial>,
+    full_upload: bool,
+}
+
+/// Updated data that should be applied (written to the GPU).
+#[must_use]
+pub(super) struct WorldUpdates<'a> {
+    pub(super) scene: Option<SceneUpload<'a>>,
+    pub(super) skybox: Option<SkyboxUpload<'a>>,
+    pub(super) camera: Option<GpuCamera>,
+    pub(super) materials: Vec<(usize, GpuMaterial)>,
+    pub(super) scene_lighting: Option<(GpuSceneUniforms, &'a [GpuSceneAliasEntry])>,
+    pub(super) skybox_uniforms: Option<GpuSkyboxUniforms>,
+    pub(super) reset_accumulation: bool,
+}
+
+/// Updated data coming from an entirely new scene that should be applied (written to the GPU).
+pub(super) struct SceneUpload<'a> {
+    pub(super) geometries: &'a [GpuTriangleGeometry],
+    pub(super) attributes: &'a [GpuTriangleAttribute],
+    pub(super) materials: &'a [GpuMaterial],
+    pub(super) bvh_nodes: &'a [GpuBvhNode],
+    pub(super) srgb_texture_atlases: &'a [Vec<u8>],
+    pub(super) linear_texture_atlases: &'a [Vec<u8>],
+}
+
+/// Updated data coming from an entirely new skybox that should be applied (written to the GPU).
+pub(super) struct SkyboxUpload<'a> {
+    pub(super) rgba: &'a [f32],
+    pub(super) uniforms: GpuSkyboxUniforms,
+    pub(super) alias_table: &'a [GpuSkyboxAliasEntry],
+}
+
+/// Contains all the data loaded from a glTF 2.0 .glb file.
 pub struct Scene {
     // geometries[i] and attributes[i] together represent a triangle at index i
-    // hence, only GpuTriangleAttribute contains material index (geometries doesn't contain any index)
-    pub geometries: Vec<GpuTriangleGeometry>,
-    pub attributes: Vec<GpuTriangleAttribute>,
-    pub materials: Vec<GpuMaterial>,
-    pub bvh_nodes: Vec<GpuBvhNode>,
+    // hence, only GpuTriangleAttribute contains material index (GpuTriangleGeometry doesn't contain any index)
+    geometries: Vec<GpuTriangleGeometry>,
+    attributes: Vec<GpuTriangleAttribute>,
+    materials: Vec<GpuMaterial>,
+    bvh_nodes: Vec<GpuBvhNode>,
     /// The array of sRGB texture atlases. Each texture atlas is a RGBA8 image (stored as a [`Vec<u8>`]) that contains multiple smaller sRGB textures packed together.
     ///
     /// For locating a specific texture, the `*_tex_layer` fields in [`GpuMaterial`] are indices into this array (or the [`Scene::linear_texture_atlases`] array)
     /// of texture atlases. Then, the `*_uv` fields should be used to access the correct portion of the texture atlas.
-    pub srgb_texture_atlases: Vec<Vec<u8>>,
+    srgb_texture_atlases: Vec<Vec<u8>>,
     /// The array of linear texture atlases. Each texture atlas is a RGBA8 image (stored as a [`Vec<u8>`]) that contains multiple smaller linear textures packed together.
     ///
     /// For locating a specific texture, the `*_tex_layer` fields in [`GpuMaterial`] are indices into this array (or the [`Scene::srgb_texture_atlases`] array)
     /// of texture atlases. Then, the `*_uv` fields should be used to access the correct portion of the texture atlas.
-    pub linear_texture_atlases: Vec<Vec<u8>>,
-    pub camera: Camera,
-    /// The initial scene data, which are used to reset the scene to its original state. Private to disallow modifications from outside this module; get with [`Scene::initial()`].
+    linear_texture_atlases: Vec<Vec<u8>>,
+    camera: Camera,
+    /// The initial scene data, for resetting editable data.
     initial: Initial,
 }
 
-/// Stores scene data that [`Scene::new()`] originally generated, before any other code modifies the public fields of these structs. Get with [`Scene::initial()`].
-pub struct Initial {
-    pub materials: Vec<GpuMaterial>,
-    pub camera: Camera,
-}
-
-/// Contains skybox texture data formatted for the GPU.
-pub struct Skybox {
-    // not GpuSkybox because this struct itself is not passed to the GPU
-    /// Should be the average luminance of the skybox in nits.
-    pub luminance: f32,
-    pub width: u32,
-    pub height: u32,
-    /// The equirectangular linear texture, with each pixel's values scaled so that the average luminance is 1 nit.
-    pub rgba: Vec<f32>,
-}
-
-/// Used for keeping track of camera data internally; not passed to the GPU.
-///
-/// See [`GpuCamera`] for the struct that is passed to the GPU, which is converted from [`Camera`] with [`Scene::takeout_gpu_camera()`].
-#[derive(Clone)]
-pub struct Camera {
-    /// Camera position X, Y, Z in world space.
-    position: glam::Vec3,
-    /// Yaw in radians.
-    yaw: f32,
-    /// Pitch in radians. Should be in [-π/2, π/2].
-    pitch: f32,
-    // focus distance is not needed since this is a pinhole camera; focus distance is implicitly 1
-    /// Vertical field of view in radians. Should be in [0, π).
-    fov_y: f32,
-    /// Width ÷ height of the image plane.
-    aspect_ratio: f32,
-    /// Movement speeds for horizontal and vertical movement, respectively, in units per second.
-    pub movement_speeds: [f32; 2], // these are pub because changing them doesn't cause camera to be dirty, so they can be changed freely
-    /// Mouse sensitivity for rotating the camera for horizontal and vertical rotations, respectively.
-    pub rotation_speeds: [f32; 2],
-    /// Whether the camera has been modified. Any method that changes [`Camera`] sets this to `true`, while [`Scene::takeout_gpu_camera()`] sets this to `false` if it was `true`.
-    dirty: bool,
+/// Stores initial scene data, for resetting editable data.
+struct Initial {
+    materials: Vec<GpuMaterial>,
+    camera: Camera,
 }
 
 /// Contains the positions of the three vertices of a triangle.
@@ -90,7 +110,7 @@ pub struct Camera {
     all(feature = "testing", not(target_arch = "wasm32")),
     derive(serde::Serialize)
 )]
-pub struct GpuTriangleGeometry {
+pub(super) struct GpuTriangleGeometry {
     // bytemuck::Pod requires alignment without implicit padding
     // although glam::Vec3A is 16 byte aligned, it has padding
     // WebGPU requirements: https://www.w3.org/TR/WGSL/#alignment-and-size
@@ -106,7 +126,7 @@ pub struct GpuTriangleGeometry {
     all(feature = "testing", not(target_arch = "wasm32")),
     derive(serde::Serialize)
 )]
-pub struct GpuTriangleAttribute {
+pub(super) struct GpuTriangleAttribute {
     /// Points to the index of a [`GpuMaterial`] in [`Scene::materials`]; indicates which material this triangle uses.
     // meshes or primitives are not passed to the GPU; instead, individual triangles themselves are passed; each triangle thus has a material index
     index: u32,
@@ -150,7 +170,7 @@ pub struct GpuTriangleAttribute {
     derive(serde::Serialize)
 )]
 #[expect(non_snake_case)]
-pub struct GpuMaterial {
+pub(super) struct GpuMaterial {
     /// Base color in linear RGBA. Linear multiplier to the base color texture; if no texture, the base color is just this color.
     ///
     /// Parsed from [material.pbrMetallicRoughness.baseColorTexture](https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html#_material_pbrmetallicroughness_basecolorfactor).
@@ -158,9 +178,9 @@ pub struct GpuMaterial {
     /// Defaults to `(1.0, 1.0, 1.0, 1.0)`; RGBA in [0, 1].
     ///
     /// Intended OpenPBR counterpart identifier: `base_color`. OpenPBR uses only RGB; default is `(0.8, 0.8, 0.8)`; RGB in [0, 1].
-    pub base_color_factor: glam::Vec4,
+    pub(super) base_color_factor: glam::Vec4,
     /// Defaults to `1.0`; in [0, 1].
-    pub OpenPBR_base_weight: f32,
+    pub(super) OpenPBR_base_weight: f32,
     /// Linear multiplier to the metallic value in the metallic-roughness texture; if no texture, this is the metallic value.
     ///
     /// Parsed from [material.pbrMetallicRoughness.metallicFactor](https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html#_material_pbrmetallicroughness_metallicfactor).
@@ -168,7 +188,7 @@ pub struct GpuMaterial {
     /// Defaults to `1.0`; in [0, 1].
     ///
     /// Intended OpenPBR counterpart identifier: `base_metalness`. OpenPBR's default is `0.0`; in [0, 1].
-    pub metallic_factor: f32,
+    pub(super) metallic_factor: f32,
     /// Linear multiplier to the roughness value in the metallic-roughness texture; if no texture, this is the roughness value.
     ///
     /// Parsed from [material.pbrMetallicRoughness.roughnessFactor](https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html#_material_pbrmetallicroughness_roughnessfactor).
@@ -176,9 +196,9 @@ pub struct GpuMaterial {
     /// Defaults to `1.0`; in [0, 1].
     ///
     /// Intended OpenPBR counterpart identifier: `base_diffuse_roughness`. OpenPBR's default is `0.0`; in [0, 1].
-    pub roughness_factor: f32,
+    pub(super) roughness_factor: f32,
     /// Defaults to `0.0`; in [0, 1].
-    pub OpenPBR_emission_weight: f32,
+    pub(super) OpenPBR_emission_weight: f32,
     /// Emission color in linear RGB and emission strength in the 4th value. RGB is a linear multiplier to the emission texture; if no texture, the emission color is just this color.
     ///
     /// RGB parsed from [material.emissiveFactor](https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html#_material_emissivefactor) and strength from [KHR_materials_emissive_strength](https://github.com/KhronosGroup/glTF/tree/main/extensions/2.0/Khronos/KHR_materials_emissive_strength).
@@ -186,7 +206,7 @@ pub struct GpuMaterial {
     /// Defaults to `(0.0, 0.0, 0.0, 1.0)`; RGB in [0, 1].
     ///
     /// Intended OpenPBR counterpart identifiers: `emission_color` and `emission_luminance`. OpenPBR's defaults are `(1.0, 1.0, 1.0)` and `1000`; RGB in [0, ∞) and luminance in [0, ∞). Luminance has units of nits.
-    pub emission_color_and_strength: glam::Vec4,
+    pub(super) emission_color_and_strength: glam::Vec4,
     /// Specular color in linear RGB and weight of specular in the 4th value. RGB is a linear multiplier to the specular color texture; if no texture, the specular color is just this color.
     ///
     /// Parsed from [KHR_materials_specular](https://github.com/KhronosGroup/glTF/tree/main/extensions/2.0/Khronos/KHR_materials_specular).
@@ -194,15 +214,15 @@ pub struct GpuMaterial {
     /// Defaults to `(1.0, 1.0, 1.0, 1.0)`; RGB is uncapped.
     ///
     /// Intended OpenPBR counterpart identifiers: `specular_color` and `specular_weight`. OpenPBR's defaults are `(1.0, 1.0, 1.0)` and `1.0`; RGB in [0, 1] and weight in [0, ∞).
-    pub specular_color_and_factor: glam::Vec4,
+    pub(super) specular_color_and_factor: glam::Vec4,
     /// Defaults to `0.3`; in [0, 1].
-    pub OpenPBR_specular_roughness: f32,
+    pub(super) OpenPBR_specular_roughness: f32,
     /// Defaults to `0.0`; in [0, 1].
-    pub OpenPBR_specular_roughness_anisotropy: f32,
+    pub(super) OpenPBR_specular_roughness_anisotropy: f32,
     /// Defaults to `0.0`; in [0, 1].
-    pub OpenPBR_specular_haze: f32,
+    pub(super) OpenPBR_specular_haze: f32,
     /// Defaults to `0.3`; in [0, 1].
-    pub OpenPBR_specular_haze_spread: f32,
+    pub(super) OpenPBR_specular_haze_spread: f32,
     /// Index of refraction.
     ///
     /// Parsed from [KHR_materials_ior](https://github.com/KhronosGroup/glTF/tree/main/extensions/2.0/Khronos/KHR_materials_ior).
@@ -210,9 +230,9 @@ pub struct GpuMaterial {
     /// Defaults to `1.5`; in [1, ∞).
     ///
     /// Intended OpenPBR counterpart identifier: `specular_ior`. OpenPBR's default is `1.5`; in (0, ∞).
-    pub ior: f32,
+    pub(super) ior: f32,
     /// Defaults to `0.0`; in [0, 1].
-    pub OpenPBR_specular_retroreflectivity: f32,
+    pub(super) OpenPBR_specular_retroreflectivity: f32,
     /// Linear scale factor for the normal texture; if no texture, should be ignored.
     ///
     /// Parsed from [material.normalTextureInfo.scale](https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html#_material_normaltextureinfo_scale).
@@ -220,7 +240,7 @@ pub struct GpuMaterial {
     /// Defaults to `1.0`.
     ///
     /// No intended OpenPBR counterpart.
-    pub normal_scale: f32,
+    pub(super) normal_scale: f32,
 
     pad: [f32; 3],
 
@@ -250,11 +270,20 @@ pub struct GpuMaterial {
     /// Offset (x, y) and scale (x, y) for the specular factor texture in an atlas; if no texture, are all zeros.
     specular_factor_uv: glam::Vec4,
 }
+pub(super) struct MaterialId {
+    scene: std::rc::Rc<()>,
+    index: usize,
+}
+impl MaterialId {
+    pub(super) const fn index(&self) -> usize {
+        self.index
+    }
+}
 
 /// A node in the BVH tree.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct GpuBvhNode {
+pub(super) struct GpuBvhNode {
     /// Axis-aligned bounding box's minimum of this node.
     aabb_min: glam::Vec3,
     /// If this node is an internal node ([`Self::tri_count`] is `0`), this value is the index of the left child node in [`Scene::bvh_nodes`].
@@ -267,8 +296,49 @@ pub struct GpuBvhNode {
     /// If this node is a leaf, this value is the number of triangles contained in this leaf node.
     tri_count: u32,
 }
+impl GpuBvhNode {
+    /// Create a new [`GpuBvhNode`] with zeros.
+    const fn new() -> Self {
+        Self {
+            aabb_min: glam::Vec3::ZERO,
+            left_first: 0,
+            aabb_max: glam::Vec3::ZERO,
+            tri_count: 0,
+        }
+    }
 
-/// Contains camera data formatted for the GPU; obtained with [`Scene::takeout_gpu_camera()`].
+    /// Update the axis-aligned bounding box to make it encompass the given triangles.
+    fn update_aabb(&mut self, triangles: &[BvhTriangle]) {
+        let mut aabb = Aabb::new();
+        for triangle in triangles {
+            aabb.union(&triangle.aabb);
+        }
+        self.aabb_min = aabb.min;
+        self.aabb_max = aabb.max;
+    }
+}
+
+/// Used for keeping track of camera data internally; not passed to the GPU.
+#[derive(Clone)]
+pub(super) struct Camera {
+    /// Camera position X, Y, Z in world space.
+    position: glam::Vec3,
+    /// Yaw in radians.
+    yaw: f32,
+    /// Pitch in radians. Should be in [-π/2, π/2].
+    pitch: f32,
+    // focus distance is not needed since this is a pinhole camera; focus distance is implicitly 1
+    /// Vertical field of view in radians. Should be in [0, π).
+    fov: f32,
+    /// Width ÷ height of the image plane.
+    aspect_ratio: f32,
+    /// Movement speeds for horizontal and vertical movement, respectively, in units per second.
+    pub(super) movement_speeds: [f32; 2],
+    /// Mouse sensitivity for rotating the camera for horizontal and vertical rotations, respectively.
+    pub(super) rotation_speeds: [f32; 2],
+}
+
+/// Contains camera data formatted for the GPU.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 /* although the 4th value of each Vec4 is unused, if having Vec3 with matching WGSL:
@@ -279,7 +349,7 @@ does not work for UNIFORM buffers
 Error: Global variable [5] 'camera' is invalid: Alignment requirements for address space Uniform are not met by [10]The array stride 4 is not a multiple of the required alignment 16naga(15)
 Even putting #[repr(C, align(16))] on this struct does not work
 */
-pub struct GpuCamera {
+pub(super) struct GpuCamera {
     /// Camera position in world space.
     position: glam::Vec4,
     /// Lower-left pixel coordinate of image plane in world space minus camera position.
@@ -364,8 +434,352 @@ impl bevy_mikktspace::Geometry for MikkTSpaceGeometry<'_> {
     }
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
+pub(super) struct GpuSceneUniforms {
+    /// Estimated lumens, ignoring emission textures. Triangles emit on both sides.
+    total_luminous_flux: f32,
+    emissive_triangles_count: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
+pub(super) struct GpuSceneAliasEntry {
+    /// Probability of accepting this slot rather than its alias.
+    threshold: f32,
+    /// Another slot in [`World::scene_alias_table`].
+    alias_index: u32,
+    triangle_index: u32,
+    selection_probability: f32,
+}
+
+/// Contains skybox texture data formatted for the GPU.
+struct Skybox {
+    /// Normalized equirectangular texture.
+    rgba: Vec<f32>,
+    uniforms: GpuSkyboxUniforms,
+    alias_table: Vec<GpuSkyboxAliasEntry>,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
+pub(super) struct GpuSkyboxUniforms {
+    /// Estimated lumens incident on the scene's bounding sphere.
+    total_luminous_flux: f32,
+    /// Solid-angle-weighted average luminance in nits; may be user-defined.
+    average_luminance: f32,
+    pub(super) width: u32,
+    pub(super) height: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
+pub(super) struct GpuSkyboxAliasEntry {
+    threshold: f32,
+    alias_index: u32,
+    selection_probability: f32,
+}
+
+/// Vose's alias method.
+///
+/// Returns a skybox alias table, but is also used to create the scene alias table via a simple mapping.
+fn alias_table(weights: &[f64]) -> Vec<GpuSkyboxAliasEntry> {
+    let total: f64 = weights.iter().sum();
+    if total <= 0.0 {
+        return Vec::new();
+    }
+    let mut entries: Vec<_> = weights
+        .iter()
+        .enumerate()
+        .map(|(index, weight)| GpuSkyboxAliasEntry {
+            threshold: 1.0,
+            alias_index: index as u32,
+            selection_probability: (weight / total) as f32,
+        })
+        .collect();
+    let mut scaled: Vec<_> = weights
+        .iter()
+        .map(|weight| weight / total * weights.len() as f64)
+        .collect();
+    let (mut small, mut large): (Vec<_>, Vec<_>) =
+        (0..weights.len()).partition(|&i| scaled[i] < 1.0);
+    while let (Some(&low), Some(&high)) = (small.last(), large.last()) {
+        small.pop();
+        large.pop();
+        entries[low].threshold = scaled[low].clamp(0.0, 1.0) as f32;
+        entries[low].alias_index = high as u32;
+        scaled[high] = (scaled[high] + scaled[low]) - 1.0;
+        if scaled[high] < 1.0 {
+            small.push(high);
+        } else {
+            large.push(high);
+        }
+    }
+    entries
+}
+
+/// Get luminance via Rec. 709 coefficients.
+fn luminance(rgb: glam::Vec3) -> f64 {
+    let rgb = rgb.as_dvec3().max(glam::DVec3::ZERO);
+    rgb.dot(glam::DVec3::new(0.2126, 0.7152, 0.0722))
+}
+
+/// Exact equirectangular row solid angle, omitting the common longitude factor.
+fn row_weight(y: u32, height: u32) -> f64 {
+    let step = std::f64::consts::PI / f64::from(height);
+    (f64::from(y) * step).cos() - (f64::from(y + 1) * step).cos()
+}
+
+impl World {
+    pub(super) fn new(
+        scene_bytes: &[u8],
+        skybox_bytes: &[u8],
+        aspect_ratio: f32,
+    ) -> anyhow::Result<Self> {
+        let mut scene = Scene::new(scene_bytes)?;
+        scene.camera.resize(aspect_ratio);
+        scene.initial.camera.resize(aspect_ratio);
+        Ok(Self {
+            scene,
+            skybox: Skybox::new(skybox_bytes)?,
+            scene_id: std::rc::Rc::new(()),
+            pending: PendingChanges {
+                full_upload: true,
+                ..Default::default()
+            },
+            scene_uniforms: GpuSceneUniforms::default(),
+            scene_alias_table: Vec::new(),
+            selected_material: None,
+        })
+    }
+
+    pub(super) fn replace_scene(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
+        let mut scene = Scene::new(bytes)?;
+        let aspect_ratio = self
+            .pending
+            .camera
+            .as_ref()
+            .unwrap_or_else(|| {
+                self.pending
+                    .scene
+                    .as_ref()
+                    .map_or(&self.scene.camera, |(s, _)| &s.camera)
+            })
+            .aspect_ratio;
+        scene.camera.resize(aspect_ratio);
+        scene.initial.camera.resize(aspect_ratio);
+        self.pending.scene = Some((scene, std::rc::Rc::new(())));
+        self.pending.camera = None;
+        self.pending.materials.clear();
+        Ok(())
+    }
+
+    pub(super) fn replace_skybox(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
+        let mut skybox = Skybox::new(bytes)?;
+        skybox.uniforms.average_luminance = self
+            .pending
+            .skybox_average_luminance
+            .unwrap_or(self.skybox.uniforms.average_luminance);
+        self.pending.skybox = Some(skybox);
+        Ok(())
+    }
+
+    /// Set the skybox average luminance in nits.
+    pub(super) const fn edit_skybox_average_luminance(&mut self, luminance: f32) {
+        self.pending.skybox_average_luminance = Some(luminance.max(0.0));
+    }
+
+    /// Get the skybox average luminance in nits.
+    pub(super) const fn skybox_average_luminance(&self) -> f32 {
+        self.skybox.uniforms.average_luminance
+    }
+
+    /// Get camera data.
+    pub(super) const fn camera(&self) -> &Camera {
+        &self.scene.camera
+    }
+    /// Get initial camera data.
+    pub(super) const fn initial_camera(&self) -> &Camera {
+        &self.scene.initial.camera
+    }
+
+    pub(super) fn edit_camera(&mut self, edit: impl FnOnce(&mut Camera)) {
+        edit(self.pending.camera.get_or_insert_with(|| {
+            self.pending
+                .scene
+                .as_ref()
+                .map_or(&self.scene.camera, |(s, _)| &s.camera)
+                .clone()
+        }));
+    }
+
+    pub(super) fn selected_material(&self) -> Option<MaterialId> {
+        self.selected_material.map(|index| MaterialId {
+            scene: std::rc::Rc::clone(&self.scene_id),
+            index,
+        })
+    }
+
+    pub(super) fn material(&self, id: &MaterialId) -> Option<(&GpuMaterial, &GpuMaterial)> {
+        if !std::rc::Rc::ptr_eq(&id.scene, &self.scene_id) {
+            return None;
+        }
+        self.scene
+            .materials
+            .get(id.index)
+            .zip(self.scene.initial.materials.get(id.index))
+    }
+
+    pub(super) fn edit_material(
+        &mut self,
+        id: &MaterialId,
+        edit: impl FnOnce(&mut GpuMaterial),
+    ) -> bool {
+        let (scene, id_pending) = self
+            .pending
+            .scene
+            .as_ref()
+            .map_or((&self.scene, &self.scene_id), |(scene, id_pending)| {
+                (scene, id_pending)
+            });
+
+        let Some(current_id) = (id.index < scene.materials.len()).then(|| MaterialId {
+            scene: std::rc::Rc::clone(id_pending),
+            index: id.index,
+        }) else {
+            return false;
+        };
+        if !std::rc::Rc::ptr_eq(&id.scene, &current_id.scene) {
+            return false;
+        }
+        let scene = self
+            .pending
+            .scene
+            .as_ref()
+            .map_or(&self.scene, |(scene, _)| scene);
+        let original = self
+            .pending
+            .materials
+            .get(&id.index)
+            .copied()
+            .unwrap_or(scene.materials[id.index]);
+        let mut candidate = original;
+        edit(&mut candidate);
+
+        let editable_size = std::mem::offset_of!(GpuMaterial, pad);
+        let candidate_bytes = &bytemuck::bytes_of(&candidate)[..editable_size];
+        if !bytemuck::cast_slice::<u8, f32>(candidate_bytes)
+            .iter()
+            .all(|value| value.is_finite())
+        {
+            return false;
+        }
+        let mut accepted = original;
+        bytemuck::bytes_of_mut(&mut accepted)[..editable_size].copy_from_slice(candidate_bytes);
+        if bytemuck::bytes_of(&accepted) == bytemuck::bytes_of(&scene.materials[id.index]) {
+            self.pending.materials.remove(&id.index);
+        } else {
+            self.pending.materials.insert(id.index, accepted);
+        }
+        true
+    }
+
+    #[expect(clippy::float_cmp)]
+    pub(super) fn take_updates(&mut self) -> WorldUpdates<'_> {
+        let pending = std::mem::take(&mut self.pending);
+        let scene_replaced = pending.scene.is_some() || pending.full_upload;
+        let skybox_replaced = pending.skybox.is_some() || pending.full_upload;
+
+        if let Some((scene, id)) = pending.scene {
+            self.scene = scene;
+            self.scene_id = id;
+        }
+        if let Some(skybox) = pending.skybox {
+            self.skybox = skybox;
+        }
+
+        let mut camera_changed = scene_replaced;
+        let mut selection_changed = scene_replaced;
+        if let Some(camera) = pending.camera {
+            selection_changed |= camera.position != self.scene.camera.position
+                || camera.yaw != self.scene.camera.yaw
+                || camera.pitch != self.scene.camera.pitch;
+            camera_changed |= selection_changed
+                || camera.fov != self.scene.camera.fov
+                || camera.aspect_ratio != self.scene.camera.aspect_ratio;
+            self.scene.camera = camera;
+        }
+
+        let mut luminance_changed = skybox_replaced;
+        if let Some(luminance) = pending.skybox_average_luminance {
+            luminance_changed |= luminance != self.skybox.uniforms.average_luminance;
+            self.skybox.uniforms.average_luminance = luminance;
+        }
+
+        let mut lighting_changed = scene_replaced;
+        let mut materials = Vec::new();
+        for (index, material) in pending.materials {
+            let old = &mut self.scene.materials[index];
+            lighting_changed |= old.OpenPBR_emission_weight != material.OpenPBR_emission_weight
+                || old.emission_color_and_strength != material.emission_color_and_strength;
+            *old = material;
+            if !scene_replaced {
+                materials.push((index, material));
+            }
+        }
+        if lighting_changed {
+            (self.scene_uniforms, self.scene_alias_table) = self.scene.uniforms_and_alias_table();
+        }
+
+        if skybox_replaced {
+            self.skybox.update_alias_table();
+        }
+        let skybox_uniforms_changed = scene_replaced || luminance_changed;
+        if skybox_uniforms_changed {
+            self.skybox
+                .update_total_luminous_flux(self.scene.radius_squared());
+        }
+
+        if selection_changed {
+            let camera = &self.scene.camera;
+            self.selected_material =
+                self.scene
+                    .pick_material(camera.position, camera.yaw, camera.pitch);
+        }
+
+        let reset_accumulation = scene_replaced
+            || skybox_replaced
+            || camera_changed
+            || luminance_changed
+            || !materials.is_empty();
+
+        WorldUpdates {
+            scene: scene_replaced.then(|| SceneUpload {
+                geometries: &self.scene.geometries,
+                attributes: &self.scene.attributes,
+                materials: &self.scene.materials,
+                bvh_nodes: &self.scene.bvh_nodes,
+                srgb_texture_atlases: &self.scene.srgb_texture_atlases,
+                linear_texture_atlases: &self.scene.linear_texture_atlases,
+            }),
+            skybox: skybox_replaced.then(|| SkyboxUpload {
+                rgba: &self.skybox.rgba,
+                uniforms: self.skybox.uniforms,
+                alias_table: &self.skybox.alias_table,
+            }),
+            camera: camera_changed.then(|| self.scene.camera.gpu_camera()),
+            materials,
+            scene_lighting: lighting_changed
+                .then_some((self.scene_uniforms, self.scene_alias_table.as_slice())),
+            skybox_uniforms: skybox_uniforms_changed.then_some(self.skybox.uniforms),
+            reset_accumulation,
+        }
+    }
+}
+
 impl Scene {
     /// Format .glb byte data for the GPU.
+    // pub for criterion
     pub fn new(bytes: &[u8]) -> anyhow::Result<Self> {
         let (document, buffers, images) =
             gltf::import_slice(bytes).context("gltf::import_slice failed")?;
@@ -818,6 +1232,7 @@ impl Scene {
         // create the root BVH node
         let mut bvh_nodes = vec![GpuBvhNode::new()];
         let triangle_count = bvh_triangles.len(); // the same as geometries.len() and attributes.len()
+        anyhow::ensure!(triangle_count > 0, "scene has no triangles");
         bvh_nodes[0].update_aabb(&bvh_triangles[0..triangle_count]); // make the root node's aabb encompass all triangles of the scene
         // start recursive BVH construction
         Self::subdivide(0, &mut bvh_nodes, &mut bvh_triangles, 0, triangle_count);
@@ -1068,46 +1483,11 @@ impl Scene {
         Self::subdivide(right_child_index, nodes, bvh_triangles, split_index, end);
     }
 
-    /// Get the scene data that [`Scene::new()`] originally generated.
-    // there's a getter rather than a direct pub field access because we want to make sure that Initial isn't modified outside of this module
-    pub const fn initial(&self) -> &Initial {
-        &self.initial
-    }
-
-    /// Get the [`GpuCamera`] struct for the GPU with the current [`Scene::camera`] values and determine which triangle the camera is directly pointed at, returning that triangle's material's index in [`Scene::materials`].
-    ///
-    /// Returns [`None`] and does no calculations if camera wasn't dirty. Otherwise, calculates fields in [`GpuCamera`], then sets camera dirty to false.
-    // not a method in impl Camera because this method also needs read access to Scene stuff
-    // takes &mut to self because it needs to set self.camera.dirty to false
-    pub fn takeout_gpu_camera(&mut self) -> Option<(GpuCamera, Option<usize>)> {
-        if !self.camera.dirty {
-            return None;
-        }
-
-        // calculate GpuCamera fields
-
-        let rotation_mat = glam::Mat3::from_rotation_y(self.camera.yaw)
-            * glam::Mat3::from_rotation_x(self.camera.pitch);
-
-        let image_plane_height = 2.0 * (self.camera.fov_y * 0.5).tan();
-
-        let horizontal3 = rotation_mat.mul_vec3(glam::Vec3::X).normalize()
-            * self.camera.aspect_ratio
-            * image_plane_height;
-
-        let vertical3 = rotation_mat.mul_vec3(glam::Vec3::NEG_Y).normalize() * image_plane_height;
-
-        // create this value just for optimization for reuse when picking material
-        let vertical3_plus_horizontal3_half = (vertical3 + horizontal3) * 0.5;
-
-        let forward3 = rotation_mat.mul_vec3(glam::Vec3::NEG_Z).normalize();
-
-        let lower_left_corner_minus_position3 = forward3 - vertical3_plus_horizontal3_half;
-
-        // use GpuCamera fields to pick material
-        // ray-triangle intersection below adopted from WGSL
-
-        let dir = (lower_left_corner_minus_position3 + vertical3_plus_horizontal3_half).normalize();
+    /// Find the material hit by a ray.
+    // pub for criterion
+    pub fn pick_material(&self, position: glam::Vec3, yaw: f32, pitch: f32) -> Option<usize> {
+        let rotation = glam::Mat3::from_rotation_y(yaw) * glam::Mat3::from_rotation_x(pitch);
+        let dir = rotation * glam::Vec3::NEG_Z;
         let dir_recip = dir.recip(); // division by zero can happen
 
         let d = dir.to_array();
@@ -1140,8 +1520,8 @@ impl Scene {
             stack_ptr -= 1;
             let node = self.bvh_nodes[stack[stack_ptr] as usize];
 
-            let t0 = (node.aabb_min - self.camera.position) * dir_recip;
-            let t1 = (node.aabb_max - self.camera.position) * dir_recip;
+            let t0 = (node.aabb_min - position) * dir_recip;
+            let t1 = (node.aabb_max - position) * dir_recip;
 
             let t_near = t0.min(t1).max_element();
             let t_far = t0.max(t1).min_element();
@@ -1155,9 +1535,9 @@ impl Scene {
                     let tri_index = (node.left_first + i) as usize;
                     let tri = self.geometries[tri_index];
 
-                    let a = (tri.v0 - self.camera.position).to_array();
-                    let b = (tri.v1 - self.camera.position).to_array();
-                    let c = (tri.v2 - self.camera.position).to_array();
+                    let a = (tri.v0 - position).to_array();
+                    let b = (tri.v1 - position).to_array();
+                    let c = (tri.v2 - position).to_array();
 
                     let ax = sx.mul_add(a[kz], a[kx]);
                     let ay = sy.mul_add(a[kz], a[ky]);
@@ -1197,20 +1577,59 @@ impl Scene {
             }
         }
 
-        self.camera.dirty = false;
+        hit_index.map(|index| self.attributes[index].index as usize)
+    }
 
-        Some((
-            GpuCamera {
-                position: glam::Vec4::from((self.camera.position, 0.0)),
-                lower_left_corner_minus_position: glam::Vec4::from((
-                    lower_left_corner_minus_position3,
-                    0.0,
-                )),
-                horizontal: glam::Vec4::from((horizontal3, 0.0)),
-                vertical: glam::Vec4::from((vertical3, 0.0)),
-            },
-            hit_index.map(|index| self.attributes[index].index as usize),
-        ))
+    /// Get the scene uniforms and alias table.
+    fn uniforms_and_alias_table(&self) -> (GpuSceneUniforms, Vec<GpuSceneAliasEntry>) {
+        let mut indices = Vec::new();
+        let mut weights = Vec::new();
+
+        for (index, (geometry, attribute)) in
+            self.geometries.iter().zip(&self.attributes).enumerate()
+        {
+            let material = self.materials[attribute.index as usize];
+            let emission = luminance(material.emission_color_and_strength.truncate())
+                * f64::from(material.emission_color_and_strength.w.max(0.0))
+                * f64::from(material.OpenPBR_emission_weight.max(0.0));
+            if emission == 0.0 {
+                continue;
+            }
+            let area = (geometry.v1.as_dvec3() - geometry.v0.as_dvec3())
+                .cross(geometry.v2.as_dvec3() - geometry.v0.as_dvec3())
+                .length()
+                * 0.5;
+            // trace_paths currently adds emission from both sides of every triangle.
+            let flux = std::f64::consts::TAU * area * emission;
+            if flux > 0.0 && flux.is_finite() {
+                indices.push(index as u32);
+                weights.push(flux);
+            }
+        }
+
+        let uniforms = GpuSceneUniforms {
+            total_luminous_flux: (weights.iter().sum::<f64>()).min(f64::from(f32::MAX)) as f32,
+            emissive_triangles_count: indices.len() as u32,
+        };
+
+        let entries = alias_table(&weights)
+            .into_iter()
+            .zip(indices)
+            .map(|(entry, triangle_index)| GpuSceneAliasEntry {
+                threshold: entry.threshold,
+                alias_index: entry.alias_index,
+                triangle_index,
+                selection_probability: entry.selection_probability,
+            })
+            .collect();
+
+        (uniforms, entries)
+    }
+
+    /// The radius of the entire scene, squared.
+    fn radius_squared(&self) -> f64 {
+        let root = self.bvh_nodes[0];
+        (root.aabb_max.as_dvec3() - root.aabb_min.as_dvec3()).length_squared() * 0.25
     }
 
     /// Save the scene data (geometries, attributes, materials) to a YAML file in a `debug_output/` directory at the crate root.
@@ -1340,67 +1759,34 @@ impl Scene {
     }
 }
 
-impl GpuBvhNode {
-    /// Create a new [`GpuBvhNode`] with zeros.
-    const fn new() -> Self {
-        Self {
-            aabb_min: glam::Vec3::ZERO,
-            left_first: 0,
-            aabb_max: glam::Vec3::ZERO,
-            tri_count: 0,
-        }
-    }
-
-    /// Update the axis-aligned bounding box to make it encompass the given triangles.
-    fn update_aabb(&mut self, triangles: &[BvhTriangle]) {
-        let mut aabb = Aabb::new();
-        for triangle in triangles {
-            aabb.union(&triangle.aabb);
-        }
-        self.aabb_min = aabb.min;
-        self.aabb_max = aabb.max;
-    }
-}
-
 impl Skybox {
     /// Create a new [`Skybox`] using [`image::load_from_memory()`] with the given `bytes`.
-    pub fn new(bytes: &[u8]) -> anyhow::Result<Self> {
+    fn new(bytes: &[u8]) -> anyhow::Result<Self> {
         let img = image::load_from_memory(bytes)?.into_rgba32f();
         // alpha isn't used, but still stored and passed to the compute shader since there's no Rgb32Float wgpu::TextureFormat
 
         let (width, height) = img.dimensions();
         if width / 2 != height {
-            log::warn!("Skybox image should usually be 2:1 aspect ratio, but is {width}x{height}");
+            log::warn!(
+                "Skybox image should usually have 2:1 aspect ratio, but is {width}x{height}"
+            );
         }
 
         let mut pixels = img.into_raw();
         // pixels[0, 1, 2, 3] are the RGBA values of pixel at the top-left corner
         // then, increasing indices go row-major (rightward first, then downward)
 
-        let mut max_luma = 0.0f32;
+        let mut max_luma = 0.0_f64;
+        let mut total_luma = 0.0_f64;
+        let total_weight = 2.0 * f64::from(width);
 
-        let mut total_luma = 0.0;
-        let mut total_weight = 0.0;
-
-        // calculate average and max luma
-        for y in 0..height {
-            // the zenith angle or colatitude, the angle downward from the north pole (y = 0 are the topmost pixels)
-            let theta = (y as f32).mul_add(std::f32::consts::PI, std::f32::consts::FRAC_PI_2)
-                / height as f32;
-            let weight = theta.sin();
-
-            for x in 0..width {
-                let index = ((y * width + x) * 4) as usize;
-                let r = pixels[index];
-                let g = pixels[index + 1];
-                let b = pixels[index + 2];
-
-                let luma = r.mul_add(0.2126, g.mul_add(0.7152, b * 0.0722));
-                // standard Rec. 709 coefficients to convert RGB -> luminance value
-
+        // Exact solid-angle row weights; the common longitude factor cancels.
+        for (y, row) in pixels.chunks_exact(width as usize * 4).enumerate() {
+            let weight = row_weight(y as u32, height);
+            for pixel in row.as_chunks::<4>().0 {
+                let luma = luminance(glam::Vec3::from_slice(pixel));
                 max_luma = max_luma.max(luma);
-                total_luma = f32::mul_add(luma, weight, total_luma);
-                total_weight += weight;
+                total_luma = luma.mul_add(weight, total_luma);
             }
         }
 
@@ -1412,10 +1798,13 @@ impl Skybox {
             log::info!("Loaded completely black skybox");
 
             return Ok(Self {
-                luminance: 0.0,
-                width: 1,
-                height: 1,
                 rgba: vec![0.0; 4],
+                uniforms: GpuSkyboxUniforms {
+                    width: 1,
+                    height: 1,
+                    ..Default::default()
+                },
+                alias_table: Vec::new(),
             });
         }
 
@@ -1425,28 +1814,17 @@ impl Skybox {
         // used to calculate standard deviation
         let mut variance_sum = 0.0;
 
-        for y in 0..height {
-            let theta = (y as f32).mul_add(std::f32::consts::PI, std::f32::consts::FRAC_PI_2)
-                / height as f32;
-            let weight = theta.sin();
-
-            for x in 0..width {
-                let index = ((y * width + x) * 4) as usize;
-                // scale pixels so average luminance is 1 nit
-                pixels[index] *= scale_factor;
-                pixels[index + 1] *= scale_factor;
-                pixels[index + 2] *= scale_factor;
-
-                // recalculate luma after scaling to measure variance
-                let r = pixels[index];
-                let g = pixels[index + 1];
-                let b = pixels[index + 2];
-                let scaled_luma = r.mul_add(0.2126, g.mul_add(0.7152, b * 0.0722));
+        for (y, row) in pixels.chunks_exact_mut(width as usize * 4).enumerate() {
+            let weight = row_weight(y as u32, height);
+            for pixel in row.as_chunks_mut::<4>().0 {
+                for channel in &mut pixel[..3] {
+                    *channel = (f64::from(*channel) * scale_factor) as f32;
+                }
+                let scaled_luma = luminance(glam::Vec3::from_slice(pixel));
 
                 // because pixels are scaled, the mean is exactly 1.0
                 // variance is the squared difference from the mean
-                let diff = scaled_luma - 1.0;
-                variance_sum = f32::mul_add(diff * diff, weight, variance_sum);
+                variance_sum = (scaled_luma - 1.0).powi(2).mul_add(weight, variance_sum);
             }
         }
 
@@ -1459,11 +1837,45 @@ impl Skybox {
         );
 
         Ok(Self {
-            luminance: avg_luma,
-            width,
-            height,
             rgba: pixels,
+            uniforms: GpuSkyboxUniforms {
+                average_luminance: avg_luma as f32,
+                width,
+                height,
+                ..Default::default()
+            },
+            alias_table: Vec::new(),
         })
+    }
+
+    fn update_alias_table(&mut self) {
+        let mut weights = Vec::with_capacity(self.rgba.len() / 4);
+        for (y, row) in self
+            .rgba
+            .chunks_exact(self.uniforms.width as usize * 4)
+            .enumerate()
+        {
+            let weight = row_weight(y as u32, self.uniforms.height);
+            weights.extend(
+                row.as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|pixel| luminance(glam::Vec3::from_slice(pixel)) * weight),
+            );
+        }
+        self.alias_table = alias_table(&weights);
+    }
+
+    fn update_total_luminous_flux(&mut self, radius_squared: f64) {
+        self.uniforms.total_luminous_flux = if self.alias_table.is_empty() {
+            0.0
+        } else {
+            // see https://www.pbr-book.org/4ed/Light_Sources/Infinite_Area_Lights
+            (4.0 * std::f64::consts::PI.powi(2)
+                * radius_squared
+                * f64::from(self.uniforms.average_luminance))
+            .min(f64::from(f32::MAX)) as f32
+        };
     }
 }
 
@@ -1628,10 +2040,25 @@ impl GpuMaterial {
 }
 
 impl Camera {
+    fn gpu_camera(&self) -> GpuCamera {
+        let rotation =
+            glam::Mat3::from_rotation_y(self.yaw) * glam::Mat3::from_rotation_x(self.pitch);
+        let height = 2.0 * (self.fov * 0.5).tan();
+        let horizontal = rotation * glam::Vec3::X * self.aspect_ratio * height;
+        let vertical = rotation * glam::Vec3::NEG_Y * height;
+        GpuCamera {
+            position: self.position.extend(0.0),
+            lower_left_corner_minus_position: (rotation * glam::Vec3::NEG_Z
+                - (horizontal + vertical) * 0.5)
+                .extend(0.0),
+            horizontal: horizontal.extend(0.0),
+            vertical: vertical.extend(0.0),
+        }
+    }
+
     /// Calculate decent starting camera values from scene bounds.
     ///
     /// `min` and `max` should come from the root BVH node's axis-aligned bounding box.
-    /// Initializes [`Camera::dirty`] to `true`.
     fn new(min: glam::Vec3, max: glam::Vec3) -> Self {
         let scene_center = (min + max) * 0.5;
         Self {
@@ -1642,16 +2069,15 @@ impl Camera {
             ),
             yaw: 0.0,
             pitch: 0.0,
-            fov_y: std::f32::consts::FRAC_PI_2,
+            fov: std::f32::consts::FRAC_PI_2,
             aspect_ratio: 1.0,
             movement_speeds: [(max.x - min.x).max(max.z - min.z) * 0.4; 2],
             rotation_speeds: [0.003; 2],
-            dirty: true,
         }
     }
 
     /// Move the camera based on currently pressed keys and distance multipliers (the amount of time elapsed since the last frame).
-    pub fn translate(
+    pub(super) fn translate(
         &mut self,
         pressed_keys: &std::collections::HashSet<winit::keyboard::KeyCode>,
         horizontal_distance: f32,
@@ -1698,44 +2124,46 @@ impl Camera {
             return;
         }
 
-        self.position += move_xz + glam::Vec3::new(0.0, vertical_movement, 0.0);
-
-        self.dirty = true;
+        self.translate_and_rotate_to(
+            Some(self.position + move_xz + glam::Vec3::new(0.0, vertical_movement, 0.0)),
+            None,
+            None,
+        );
     }
 
     /// Rotate the camera based on mouse movement deltas. `dx` and `dy` are the changes in mouse position.
-    pub const fn rotate(&mut self, dx: f32, dy: f32) {
+    pub(super) const fn rotate(&mut self, dx: f32, dy: f32) {
         self.yaw -= dx * self.rotation_speeds[0];
         self.pitch -= dy * self.rotation_speeds[1];
 
         self.pitch = self
             .pitch
             .clamp(-std::f32::consts::FRAC_PI_2, std::f32::consts::FRAC_PI_2);
-
-        self.dirty = true;
     }
 
     /// Resize the camera's aspect ratio.
-    pub const fn resize(&mut self, aspect_ratio: f32) {
-        self.aspect_ratio = aspect_ratio;
-        self.dirty = true;
+    pub(super) fn resize(&mut self, aspect_ratio: f32) {
+        if aspect_ratio.is_finite() && aspect_ratio > 0.0 {
+            self.aspect_ratio = aspect_ratio;
+        } else {
+            log::error!("Aspect ratio must be finite and positive.");
+        }
     }
 
     /// Change the camera's vertical field of view in radians. Clamps to [0, π).
-    pub const fn set_fov(&mut self, fov_y: f32) {
-        self.fov_y = fov_y.clamp(0.0, std::f32::consts::PI - f32::EPSILON);
-        self.dirty = true;
+    pub(super) const fn set_fov(&mut self, fov: f32) {
+        self.fov = fov.clamp(0.0, std::f32::consts::PI - f32::EPSILON);
     }
 
     /// Get the vertical field of view.
-    pub const fn fov_y(&self) -> f32 {
-        self.fov_y
+    pub(super) const fn fov(&self) -> f32 {
+        self.fov
     }
 
     /// Move the camera to a specific world-space position and rotation; yaw and pitch in radians.
     ///
     /// The coordinate system is: +X to the right of the screen, +Y up the screen, and -Z into the screen.
-    pub fn translate_and_rotate_to(
+    pub(super) fn translate_and_rotate_to(
         &mut self,
         position: Option<glam::Vec3>,
         yaw: Option<f32>,
@@ -1743,22 +2171,23 @@ impl Camera {
     ) {
         self.position = position.unwrap_or(self.position);
         self.yaw = yaw.unwrap_or(self.yaw);
-        self.pitch = pitch.unwrap_or(self.pitch);
-        self.dirty = true;
+        self.pitch = pitch
+            .unwrap_or(self.pitch)
+            .clamp(-std::f32::consts::FRAC_PI_2, std::f32::consts::FRAC_PI_2);
     }
 
     /// Get the position in world space.
-    pub const fn position(&self) -> glam::Vec3 {
+    pub(super) const fn position(&self) -> glam::Vec3 {
         self.position
     }
 
     /// Get the yaw in radians.
-    pub const fn yaw(&self) -> f32 {
+    pub(super) const fn yaw(&self) -> f32 {
         self.yaw
     }
 
     /// Get the pitch in radians.
-    pub const fn pitch(&self) -> f32 {
+    pub(super) const fn pitch(&self) -> f32 {
         self.pitch
     }
 }

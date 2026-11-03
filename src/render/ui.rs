@@ -5,7 +5,7 @@
 use super::world;
 
 /// Define the look of the UI.
-pub fn style() -> egui::Style {
+pub(super) fn style() -> egui::Style {
     use egui::{
         Color32, CornerRadius, CursorIcon, FontId, Margin, Shadow, Stroke, Style, TextStyle, vec2,
     };
@@ -121,10 +121,9 @@ fn key_label(ui: &mut egui::Ui, text: &str) {
 }
 
 /// What the user is doing in the base UI, which [`run_base()`] returns.
-pub enum BaseUiAction {
+pub(super) enum BaseUiAction {
     UploadScene,
     UploadSkybox,
-    UpdateSkyboxLuminance,
 }
 
 /// Run the base UI. Should be called inside the closure for [`egui::Context::run_ui()`].
@@ -132,10 +131,9 @@ pub enum BaseUiAction {
 /// `dt` is the change in time since the last frame in seconds, used to display the FPS in this UI.
 /// `frame_count` is displayed in this UI as just `{frame_count} Frames`.
 /// `upload_status`, if not empty, is displayed below the buttons for uploading files.
-pub fn run_base(
+pub(super) fn run_base(
     root_ui: &egui::Ui,
-    scene: &mut world::Scene,
-    skybox: &mut world::Skybox,
+    world: &mut world::World,
     dt: f32,
     frame_count: u32,
     upload_status: &str,
@@ -215,7 +213,7 @@ pub fn run_base(
                             ui.label(upload_status);
                         }
 
-                        let mut skybox_luminance = skybox.luminance;
+                        let mut skybox_luminance = world.skybox_average_luminance();
                         if ui
                             .add(
                                 egui::Slider::new(&mut skybox_luminance, 0.0..=20_000.0)
@@ -223,41 +221,46 @@ pub fn run_base(
                             )
                             .changed()
                         {
-                            skybox.luminance = skybox_luminance;
-                            actions.push(BaseUiAction::UpdateSkyboxLuminance);
+                            world.edit_skybox_average_luminance(skybox_luminance);
                         }
                     });
 
-                    ui.collapsing("Camera", |ui| {
-                        let pos = scene.camera.position();
-                        ui.label(format!(
-                            "({:.2}, {:.2}, {:.2})  ↔ {:.2}  ↕{:.2}",
-                            pos.x,
-                            pos.y,
-                            pos.z,
-                            scene.camera.yaw(),
-                            scene.camera.pitch(),
-                        ));
+                    let prepared_camera = world.camera().clone();
+                    let initial_camera = world.initial_camera().clone();
+                    world.edit_camera(|camera| {
+                        ui.collapsing("Camera", |ui| {
+                            let pos = prepared_camera.position();
+                            ui.label(format!(
+                                "({:.2}, {:.2}, {:.2})  ↔ {:.2}  ↕{:.2}",
+                                pos.x,
+                                pos.y,
+                                pos.z,
+                                prepared_camera.yaw(),
+                                prepared_camera.pitch(),
+                            ));
 
-                        // fov
-                        let mut fov_deg = scene.camera.fov_y().to_degrees();
-                        let mut fov_slider = ui.add(
-                            egui::Slider::new(&mut fov_deg, 20.0..=150.0)
-                                .text("FOV")
-                                .suffix("°"),
-                        );
-                        if fov_slider.drag_stopped_by(egui::PointerButton::Secondary)
-                            || fov_slider.secondary_clicked()
-                        {
-                            fov_deg = scene.initial().camera.fov_y().to_degrees();
-                            fov_slider.mark_changed();
-                        }
-                        if fov_slider.changed() {
-                            scene.camera.set_fov(fov_deg.to_radians());
-                        }
+                            // fov
+                            let mut fov_deg = camera.fov().to_degrees();
+                            let mut fov_slider = ui.add(
+                                egui::Slider::new(&mut fov_deg, 20.0..=150.0)
+                                    .text("FOV")
+                                    .suffix("°"),
+                            );
+                            if fov_slider.drag_stopped_by(egui::PointerButton::Secondary)
+                                || fov_slider.secondary_clicked()
+                            {
+                                fov_deg = initial_camera.fov().to_degrees();
+                                fov_slider.mark_changed();
+                            }
+                            if fov_slider.changed() {
+                                camera.set_fov(fov_deg.to_radians());
+                            }
 
-                        let speed_slider =
-                            |ui: &mut egui::Ui, val: &mut f32, initial: f32, text: &str| -> bool {
+                            let speed_slider = |ui: &mut egui::Ui,
+                                                val: &mut f32,
+                                                initial: f32,
+                                                text: &str|
+                             -> bool {
                                 let mut response = ui.add(
                                     egui::Slider::new(val, (initial * 0.01)..=(initial * 5.0))
                                         .text(text)
@@ -280,25 +283,26 @@ pub fn run_base(
                                 response.changed()
                             };
 
-                        let initial_rot = scene.initial().camera.rotation_speeds[0];
-                        if speed_slider(
-                            ui,
-                            &mut scene.camera.rotation_speeds[0],
-                            initial_rot,
-                            "Rotation Speed",
-                        ) {
-                            scene.camera.rotation_speeds[1] = scene.camera.rotation_speeds[0];
-                        }
+                            let initial_rot = initial_camera.rotation_speeds[0];
+                            if speed_slider(
+                                ui,
+                                &mut camera.rotation_speeds[0],
+                                initial_rot,
+                                "Rotation Speed",
+                            ) {
+                                camera.rotation_speeds[1] = camera.rotation_speeds[0];
+                            }
 
-                        let initial_mov = scene.initial().camera.movement_speeds[0];
-                        if speed_slider(
-                            ui,
-                            &mut scene.camera.movement_speeds[0],
-                            initial_mov,
-                            "Move Speed",
-                        ) {
-                            scene.camera.movement_speeds[1] = scene.camera.movement_speeds[0];
-                        }
+                            let initial_mov = initial_camera.movement_speeds[0];
+                            if speed_slider(
+                                ui,
+                                &mut camera.movement_speeds[0],
+                                initial_mov,
+                                "Move Speed",
+                            ) {
+                                camera.movement_speeds[1] = camera.movement_speeds[0];
+                            }
+                        });
                     });
 
                     let github_button_rect = egui::Rect::from_center_size(
@@ -378,233 +382,200 @@ pub fn run_base(
     actions
 }
 
-/// What the user is doing in the modify material UI, which [`run_modify_material()`] returns.
-pub enum ModifyMaterialUiAction {
-    Unmodified,
-    Modified { emission_modified: bool },
-}
-
 /// Run the UI for modifying a material. Should be called inside the closure for [`egui::Context::run_ui()`].
-///
-/// `material_index` should come from [`world::Scene::takeout_gpu_camera()`] unwrapped.
-///
-/// Returns whether the user modified the material through this UI.
-/// When `true` is returned, the user modified the material at the `material_index` index in [`world::Scene::materials`], so this material has changed in [`world::Scene`] already (as this function takes `&mut` to [`world::Scene`]).
-pub fn run_modify_material(
+pub(super) fn run_modify_material(
     root_ui: &egui::Ui,
-    scene: &mut world::Scene,
-    material_index: usize,
-) -> ModifyMaterialUiAction {
-    let mut mat_changed = false;
-    let mut emission_modified = false;
+    world: &mut world::World,
+    material: &world::MaterialId,
+) {
+    let Some((_, initial_mat)) = world.material(material) else {
+        return;
+    };
+    let initial_mat = *initial_mat;
+    let material_index = material.index();
+    world.edit_material(material, |mat| {
+        egui::Window::new(format!("Material {material_index}"))
+            .id(egui::Id::new("Material Properties"))
+            .movable(true)
+            .collapsible(true)
+            .default_pos(egui::pos2(6.0, 6.0))
+            .default_width(305.0)
+            .scroll(true)
+            .order(egui::Order::Middle)
+            .show(root_ui.ctx(), |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Right click to reset a slider.");
 
-    egui::Window::new(format!("Material {material_index}"))
-        .id(egui::Id::new("Material Properties"))
-        .movable(true)
-        .collapsible(true)
-        .default_pos(egui::pos2(6.0, 6.0))
-        .default_width(305.0)
-        .scroll(true)
-        .order(egui::Order::Middle)
-        .show(root_ui.ctx(), |ui| {
-            let initial_mat = scene.initial().materials[material_index];
-            let mat = &mut scene.materials[material_index];
-
-            ui.horizontal(|ui| {
-                ui.label("Right click to reset a slider.");
-
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
-                    if ui.button("Reset all").clicked() {
-                        *mat = initial_mat;
-                        mat_changed = true;
-                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+                        if ui.button("Reset all").clicked() {
+                            *mat = initial_mat;
+                        }
+                    });
                 });
+
+                ui.separator();
+
+                let mat_slider = |ui: &mut egui::Ui,
+                                  val: &mut f32,
+                                  initial: f32,
+                                  range: std::ops::RangeInclusive<f32>,
+                                  text: &str| {
+                    let mut response = ui.add(egui::Slider::new(val, range).text(text));
+                    if response.drag_stopped_by(egui::PointerButton::Secondary)
+                        || response.secondary_clicked()
+                    {
+                        *val = initial;
+                        response.mark_changed();
+                    }
+                };
+
+                let color_rgba = |ui: &mut egui::Ui,
+                                  color: &mut glam::Vec4,
+                                  initial: glam::Vec4,
+                                  label: &str| {
+                    let mut arr = color.to_array();
+                    ui.horizontal(|ui| {
+                        let mut btn = ui.color_edit_button_rgba_unmultiplied(&mut arr); // linear
+                        if btn.secondary_clicked() {
+                            arr = initial.to_array();
+                            btn.mark_changed();
+                        }
+                        if btn.changed() {
+                            *color = glam::Vec4::from_array(arr);
+                        }
+                        ui.label(label);
+                    });
+                };
+
+                let color_rgb = |ui: &mut egui::Ui,
+                                 color: &mut glam::Vec4,
+                                 initial: glam::Vec4,
+                                 label: &str| {
+                    let mut arr = [color.x, color.y, color.z];
+                    ui.horizontal(|ui| {
+                        let mut btn = ui.color_edit_button_rgb(&mut arr); // linear
+                        if btn.secondary_clicked() {
+                            arr = [initial.x, initial.y, initial.z];
+                            btn.mark_changed();
+                        }
+                        if btn.changed() {
+                            color.x = arr[0];
+                            color.y = arr[1];
+                            color.z = arr[2];
+                        }
+                        ui.label(label);
+                    });
+                };
+
+                mat_slider(
+                    ui,
+                    &mut mat.OpenPBR_base_weight,
+                    initial_mat.OpenPBR_base_weight,
+                    0.0..=1.0,
+                    "Base Weight",
+                );
+                color_rgba(
+                    ui,
+                    &mut mat.base_color_factor,
+                    initial_mat.base_color_factor,
+                    "Base Color",
+                );
+                mat_slider(
+                    ui,
+                    &mut mat.roughness_factor,
+                    initial_mat.roughness_factor,
+                    0.0..=1.0,
+                    "Base Diffuse Roughness",
+                );
+                mat_slider(
+                    ui,
+                    &mut mat.metallic_factor,
+                    initial_mat.metallic_factor,
+                    0.0..=1.0,
+                    "Base Metalness",
+                );
+
+                mat_slider(
+                    ui,
+                    &mut mat.specular_color_and_factor.w,
+                    initial_mat.specular_color_and_factor.w,
+                    0.0..=10.0,
+                    "Specular Weight",
+                );
+                color_rgb(
+                    ui,
+                    &mut mat.specular_color_and_factor,
+                    initial_mat.specular_color_and_factor,
+                    "Specular Color",
+                );
+
+                mat_slider(
+                    ui,
+                    &mut mat.OpenPBR_specular_roughness,
+                    initial_mat.OpenPBR_specular_roughness,
+                    0.0..=1.0,
+                    "Specular Roughness",
+                );
+                mat_slider(ui, &mut mat.ior, initial_mat.ior, 0.0..=3.0, "Specular IOR");
+                mat_slider(
+                    ui,
+                    &mut mat.OpenPBR_specular_roughness_anisotropy,
+                    initial_mat.OpenPBR_specular_roughness_anisotropy,
+                    0.0..=1.0,
+                    "Specular Anisotropy",
+                );
+                mat_slider(
+                    ui,
+                    &mut mat.OpenPBR_specular_haze,
+                    initial_mat.OpenPBR_specular_haze,
+                    0.0..=1.0,
+                    "Specular Haze",
+                );
+                mat_slider(
+                    ui,
+                    &mut mat.OpenPBR_specular_haze_spread,
+                    initial_mat.OpenPBR_specular_haze_spread,
+                    0.0..=1.0,
+                    "Specular Haze Spread",
+                );
+                mat_slider(
+                    ui,
+                    &mut mat.OpenPBR_specular_retroreflectivity,
+                    initial_mat.OpenPBR_specular_retroreflectivity,
+                    0.0..=1.0,
+                    "Specular Retroreflectivity",
+                );
+
+                mat_slider(
+                    ui,
+                    &mut mat.OpenPBR_emission_weight,
+                    initial_mat.OpenPBR_emission_weight,
+                    0.0..=1.0,
+                    "Emission Weight",
+                );
+
+                mat_slider(
+                    ui,
+                    &mut mat.emission_color_and_strength.w,
+                    initial_mat.emission_color_and_strength.w,
+                    0.0..=1_500_000.0,
+                    "Emission Luminance (nits)",
+                );
+
+                color_rgb(
+                    ui,
+                    &mut mat.emission_color_and_strength,
+                    initial_mat.emission_color_and_strength,
+                    "Emission Color",
+                );
+
+                mat_slider(
+                    ui,
+                    &mut mat.normal_scale,
+                    initial_mat.normal_scale,
+                    0.0..=10.0,
+                    "Normal Scale",
+                );
             });
-
-            ui.separator();
-
-            let mat_slider = |ui: &mut egui::Ui,
-                              val: &mut f32,
-                              initial: f32,
-                              range: std::ops::RangeInclusive<f32>,
-                              text: &str|
-             -> bool {
-                let mut response = ui.add(egui::Slider::new(val, range).text(text));
-                if response.drag_stopped_by(egui::PointerButton::Secondary)
-                    || response.secondary_clicked()
-                {
-                    *val = initial;
-                    response.mark_changed();
-                }
-                response.changed()
-            };
-
-            let color_rgba = |ui: &mut egui::Ui,
-                              color: &mut glam::Vec4,
-                              initial: glam::Vec4,
-                              label: &str|
-             -> bool {
-                let mut arr = color.to_array();
-                let mut changed = false;
-                ui.horizontal(|ui| {
-                    let mut btn = ui.color_edit_button_rgba_unmultiplied(&mut arr); // linear
-                    if btn.secondary_clicked() {
-                        arr = initial.to_array();
-                        btn.mark_changed();
-                    }
-                    if btn.changed() {
-                        *color = glam::Vec4::from_array(arr);
-                        changed = true;
-                    }
-                    ui.label(label);
-                });
-                changed
-            };
-
-            let color_rgb = |ui: &mut egui::Ui,
-                             color: &mut glam::Vec4,
-                             initial: glam::Vec4,
-                             label: &str|
-             -> bool {
-                let mut arr = [color.x, color.y, color.z];
-                let mut changed = false;
-                ui.horizontal(|ui| {
-                    let mut btn = ui.color_edit_button_rgb(&mut arr); // linear
-                    if btn.secondary_clicked() {
-                        arr = [initial.x, initial.y, initial.z];
-                        btn.mark_changed();
-                    }
-                    if btn.changed() {
-                        color.x = arr[0];
-                        color.y = arr[1];
-                        color.z = arr[2];
-                        changed = true;
-                    }
-                    ui.label(label);
-                });
-                changed
-            };
-
-            mat_changed |= mat_slider(
-                ui,
-                &mut mat.OpenPBR_base_weight,
-                initial_mat.OpenPBR_base_weight,
-                0.0..=1.0,
-                "Base Weight",
-            );
-            mat_changed |= color_rgba(
-                ui,
-                &mut mat.base_color_factor,
-                initial_mat.base_color_factor,
-                "Base Color",
-            );
-            mat_changed |= mat_slider(
-                ui,
-                &mut mat.roughness_factor,
-                initial_mat.roughness_factor,
-                0.0..=1.0,
-                "Base Diffuse Roughness",
-            );
-            mat_changed |= mat_slider(
-                ui,
-                &mut mat.metallic_factor,
-                initial_mat.metallic_factor,
-                0.0..=1.0,
-                "Base Metalness",
-            );
-
-            mat_changed |= mat_slider(
-                ui,
-                &mut mat.specular_color_and_factor.w,
-                initial_mat.specular_color_and_factor.w,
-                0.0..=10.0,
-                "Specular Weight",
-            );
-            mat_changed |= color_rgb(
-                ui,
-                &mut mat.specular_color_and_factor,
-                initial_mat.specular_color_and_factor,
-                "Specular Color",
-            );
-
-            mat_changed |= mat_slider(
-                ui,
-                &mut mat.OpenPBR_specular_roughness,
-                initial_mat.OpenPBR_specular_roughness,
-                0.0..=1.0,
-                "Specular Roughness",
-            );
-            mat_changed |= mat_slider(ui, &mut mat.ior, initial_mat.ior, 0.0..=3.0, "Specular IOR");
-            mat_changed |= mat_slider(
-                ui,
-                &mut mat.OpenPBR_specular_roughness_anisotropy,
-                initial_mat.OpenPBR_specular_roughness_anisotropy,
-                0.0..=1.0,
-                "Specular Anisotropy",
-            );
-            mat_changed |= mat_slider(
-                ui,
-                &mut mat.OpenPBR_specular_haze,
-                initial_mat.OpenPBR_specular_haze,
-                0.0..=1.0,
-                "Specular Haze",
-            );
-            mat_changed |= mat_slider(
-                ui,
-                &mut mat.OpenPBR_specular_haze_spread,
-                initial_mat.OpenPBR_specular_haze_spread,
-                0.0..=1.0,
-                "Specular Haze Spread",
-            );
-            mat_changed |= mat_slider(
-                ui,
-                &mut mat.OpenPBR_specular_retroreflectivity,
-                initial_mat.OpenPBR_specular_retroreflectivity,
-                0.0..=1.0,
-                "Specular Retroreflectivity",
-            );
-
-            let emission_weight_changed = mat_slider(
-                ui,
-                &mut mat.OpenPBR_emission_weight,
-                initial_mat.OpenPBR_emission_weight,
-                0.0..=1.0,
-                "Emission Weight",
-            );
-            mat_changed |= emission_weight_changed;
-            emission_modified |= emission_weight_changed;
-
-            let emission_luminance_changed = mat_slider(
-                ui,
-                &mut mat.emission_color_and_strength.w,
-                initial_mat.emission_color_and_strength.w,
-                0.0..=1_500_000.0,
-                "Emission Luminance (nits)",
-            );
-            mat_changed |= emission_luminance_changed;
-            emission_modified |= emission_luminance_changed;
-
-            let emission_color_changed = color_rgb(
-                ui,
-                &mut mat.emission_color_and_strength,
-                initial_mat.emission_color_and_strength,
-                "Emission Color",
-            );
-            mat_changed |= emission_color_changed;
-            emission_modified |= emission_color_changed;
-
-            mat_changed |= mat_slider(
-                ui,
-                &mut mat.normal_scale,
-                initial_mat.normal_scale,
-                0.0..=10.0,
-                "Normal Scale",
-            );
-        });
-
-    if mat_changed {
-        ModifyMaterialUiAction::Modified { emission_modified }
-    } else {
-        ModifyMaterialUiAction::Unmodified
-    }
+    });
 }

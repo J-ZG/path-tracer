@@ -73,7 +73,7 @@ image = { version = "0.25.10", default-features = false, features = [
 bytemuck = { version = "1.25.2", default-features = false, features = [
     "derive",
 ] }
-glam = { version = "0.34.1", default-features = false, features = [
+glam = { version = "0.34.2", default-features = false, features = [
     "std",
     "all-types",
     "bytemuck",
@@ -93,13 +93,13 @@ egui-wgpu = { version = "0.36.2", default-features = false }
 egui_extras = { version = "0.36.2", default-features = false, features = [
     "svg",
 ] }
-log = { version = "0.4.34", default-features = false }
+log = { version = "0.4.35", default-features = false }
 anyhow = { version = "1.0.104", default-features = false }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-wasm-bindgen = { version = "0.2.127", default-features = false }
-wasm-bindgen-futures = { version = "0.4.77", default-features = false }
-web-sys = { version = "0.3.104", default-features = false, features = [
+wasm-bindgen = { version = "0.2.130", default-features = false }
+wasm-bindgen-futures = { version = "0.4.80", default-features = false }
+web-sys = { version = "0.3.107", default-features = false, features = [
     # for getting the .glb file on the web 
     "Response",
     # for logger.rs
@@ -107,7 +107,7 @@ web-sys = { version = "0.3.104", default-features = false, features = [
     "CustomEventInit",
     # more features are used, but other crates enabled them already
 ] }
-js-sys = { version = "0.3.104", default-features = false }
+js-sys = { version = "0.3.107", default-features = false }
 egui-winit = { version = "0.36.2", default-features = false, features = [
     "links",
 ] } # clipboard feature isn't supported on WASM

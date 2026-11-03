@@ -1,7 +1,7 @@
 # [path-tracer](https://j-zg.github.io/path-tracer/)
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/J-ZG/path-tracer/refs/heads/main/doc/box_render.jpeg" style="max-height: 330px; width: auto;">
+  <img src="https://raw.githubusercontent.com/J-ZG/path-tracer/refs/heads/main/doc/box_render.jpeg" style="max-height: 300px; width: auto;">
 </p>
 
 A demo real-time 3D path tracer built with WebGPU ([wgpu](https://github.com/gfx-rs/wgpu)) and Rust, implementing modern rendering techniques.
@@ -71,7 +71,7 @@ path-tracer/
 ## Development
 
 * `cargo c` and `cargo cw`: Run Clippy for linting native and `target_arch = "wasm32"` code, respectively.
-* `cargo t`: Run with `testing` feature enabled, allowing more debug information to be outputted during running (which may significantly worsen performance). The local wgpu-profiler patch supports Metal timestamp initialization on macOS (see [`vendor/README.md`](vendor/README.md)). `testing` feature is only supported on native, since debug output files are saved to disk, in `debug_output/` (which is gitignored). If there are errors during build related to C++, it's often because build tools are missing; one option is to install them through [Build Tools for Visual Studio](https://visualstudio.microsoft.com/downloads/#build-tools-for-visual-studio-2026). Profiling with Tracy is supported:
+* `cargo t`: Run with `testing` feature enabled, allowing more debug information to be outputted during running (which may significantly worsen performance). `testing` feature is only supported on native, since debug output files are saved to disk, in `debug_output/` (which is gitignored). If there are errors during build related to C++, it's often because build tools are missing; one option is to install them through [Build Tools for Visual Studio](https://visualstudio.microsoft.com/downloads/#build-tools-for-visual-studio-2026). Profiling with Tracy is supported:
     1. Download [Tracy](https://github.com/wolfpld/tracy/releases/).
     1. Have the Tracy profiler open while path-tracer is running. path-tracer-app should appear under the discovered clients.
 * `cargo bench --bench filename -- function`: Run a benchmark. `filename` is a filename in [`benches/`](https://github.com/j-zg/path-tracer/tree/main/benches), and `function` is the ID of a `bench_function`. Criterion is used; view the detailed benchmark reports at `target/criterion/report/index.html`.

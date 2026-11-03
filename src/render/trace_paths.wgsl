@@ -109,6 +109,31 @@ struct Camera {
     vertical: vec4f,
 }
 
+struct SceneUniforms {
+    total_luminous_flux: f32,
+    emissive_triangles_count: u32,
+}
+
+struct SceneAliasEntry {
+    threshold: f32,
+    alias_index: u32,
+    triangle_index: u32,
+    selection_probability: f32,
+}
+
+struct SkyboxUniforms {
+    total_luminous_flux: f32,
+    average_luminance: f32,
+    width: u32,
+    height: u32,
+}
+
+struct SkyboxAliasEntry {
+    threshold: f32,
+    alias_index: u32,
+    selection_probability: f32,
+}
+
 @group(0) @binding(0) var screen: texture_storage_2d<rgba32float, write>;
 @group(0) @binding(1) var<storage, read_write> accumulation_buffer: array<vec4f>; // this is actually used as a texture, but since textures cannot be both read and write, a storage buffer is used instead
 
@@ -122,8 +147,11 @@ struct Camera {
 @group(1) @binding(7) var<uniform> camera: Camera;
 @group(1) @binding(8) var<uniform> frame_count: u32;
 @group(1) @binding(9) var skybox_texture: texture_2d<f32>;
-@group(1) @binding(10) var<uniform> skybox_luminance: f32;
+@group(1) @binding(10) var<uniform> skybox: SkyboxUniforms;
 @group(1) @binding(11) var skybox_sampler: sampler;
+@group(1) @binding(12) var<uniform> scene: SceneUniforms;
+@group(1) @binding(13) var<storage, read> scene_aliases: array<SceneAliasEntry>;
+@group(1) @binding(14) var<storage, read> skybox_aliases: array<SkyboxAliasEntry>;
 
 // PCG random number generator
 // https://www.pcg-random.org/index.html
@@ -552,7 +580,7 @@ fn compute_main(@builtin(global_invocation_id) global_id: vec3u) {
 
             let sky_color = textureSampleLevel(skybox_texture, skybox_sampler, vec2f(u, v), 0.0).rgb;
 
-            final_color += throughput * sky_color * skybox_luminance;
+            final_color += throughput * sky_color * skybox.average_luminance;
             break; // terminate this ray; this pixel's final color is now determined
         }
 
