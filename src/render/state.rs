@@ -126,6 +126,13 @@ impl State {
         display_handle: winit::event_loop::OwnedDisplayHandle,
     ) -> anyhow::Result<Self> {
         let egui_context = egui::Context::default();
+        // egui-winit uses the operating system to choose Cmd or Ctrl for shortcuts
+        #[cfg(target_arch = "wasm32")]
+        if let Some(window) = web_sys::window()
+            && let Ok(user_agent) = window.navigator().user_agent()
+        {
+            egui_context.set_os(egui::os::OperatingSystem::from_user_agent(&user_agent));
+        }
         egui_context.set_theme(egui::Theme::Dark);
         egui_context.set_style_of(egui_context.theme(), ui::style());
         egui_extras::install_image_loaders(&egui_context);
@@ -763,6 +770,28 @@ impl State {
                 let mut platform_output = full_output.platform_output;
                 if matches!(self.user_mode, UserMode::CursorGrabbed(_)) {
                     platform_output.cursor_icon = egui::CursorIcon::None; // disallow egui from making cursor visible when cursor is grabbed, even if egui requests a visible cursor (for example, when hovering over a text input field)
+                }
+                // egui-winit's wasm clipboard only stores text inside the app
+                // write copy/cut output to the browser clipboard
+                #[cfg(target_arch = "wasm32")]
+                for command in &platform_output.commands {
+                    if let egui::OutputCommand::CopyText(text) = command
+                        && let Some(window) = web_sys::window()
+                    {
+                        let clipboard = window.navigator().clipboard();
+                        if clipboard.is_undefined() {
+                            log::warn!("Browser clipboard is unavailable; use HTTPS or localhost");
+                            continue;
+                        }
+                        let write = clipboard.write_text(text);
+                        wasm_bindgen_futures::spawn_local(async move {
+                            if let Err(error) = wasm_bindgen_futures::JsFuture::from(write).await {
+                                log::warn!(
+                                    "Failed to copy text to the browser clipboard: {error:?}"
+                                );
+                            }
+                        });
+                    }
                 }
                 // mainly for this app, just updates cursor icon and clipboard
                 self.egui_winit_state

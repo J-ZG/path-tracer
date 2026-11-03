@@ -14,6 +14,9 @@ pub(super) fn style() -> egui::Style {
 
     style.spacing.item_spacing = vec2(8.0, 3.0);
     style.spacing.window_margin = Margin::same(8);
+    // preserve the compact controls from egui 0.36.2 before the default sizes increased in 0.37.0
+    style.spacing.button_padding = vec2(4.0, 1.0);
+    style.spacing.interact_size = vec2(40.0, 18.0);
     style.spacing.slider_width = 80.0;
     style.spacing.slider_rail_height = 9.0;
 
@@ -150,7 +153,7 @@ pub(super) fn run_base(
     painter.line_segment([center - dy, center + dy], stroke);
 
     // frame count and FPS display
-    egui::Area::new(egui::Id::new("Frame count and FPS")) // Area takes stuff inside it out of the root_ui layout flow
+    egui::Area::new(egui::Id::unique("Frame count and FPS")) // Area takes stuff inside it out of the root_ui layout flow
         .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-4.0, 0.0))
         .show(root_ui.ctx(), |ui| {
             ui.with_layout(egui::Layout::top_down(egui::Align::RIGHT), |ui| {
@@ -161,7 +164,7 @@ pub(super) fn run_base(
     let mut actions = Vec::new();
 
     // hint and sliders
-    egui::Area::new(egui::Id::new("Hint"))
+    egui::Area::new(egui::Id::unique("Hint"))
         .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(0.0, 0.0))
         .show(root_ui.ctx(), |ui| {
             egui::Frame::window(ui.style())
@@ -315,7 +318,7 @@ pub(super) fn run_base(
 
                     let github_button_response = ui.interact(
                         github_button_rect,
-                        ui.id().with("Github Button"),
+                        ui.scope_id().with("GitHub button"),
                         egui::Sense::click(),
                     );
 
@@ -358,7 +361,7 @@ pub(super) fn run_base(
 
         let painter = root_ui.layer_painter(egui::LayerId::new(
             egui::Order::Foreground,
-            egui::Id::new("File drop overlay"),
+            egui::Id::unique("File drop overlay"),
         ));
 
         painter.rect_filled(overlay_rect, 0.0, egui::Color32::from_black_alpha(150));
@@ -395,7 +398,7 @@ pub(super) fn run_modify_material(
     let material_index = material.index();
     world.edit_material(material, |mat| {
         egui::Window::new(format!("Material {material_index}"))
-            .id(egui::Id::new("Material Properties"))
+            .id(egui::Id::unique("Material Properties"))
             .movable(true)
             .collapsible(true)
             .default_pos(egui::pos2(6.0, 6.0))

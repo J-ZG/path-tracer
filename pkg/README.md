@@ -39,7 +39,7 @@ cargo install wasm-pack
 wasm-pack build --target web
 ```
 
-To start a server on localhost, use Python's built-in server `python -m http.server` or install simple-http-server, and then start hosting:
+To start a server on localhost, use Python's built-in server `python3 -m http.server` or install simple-http-server, and then start hosting:
 
 ```bash
 cargo install simple-http-server
