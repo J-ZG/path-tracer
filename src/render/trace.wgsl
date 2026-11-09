@@ -183,6 +183,22 @@ fn rand() -> f32 {
     return bitcast<f32>(0x3f800000u | (((word >> 22u) ^ word) >> 9u)) - 1.0;
 }
 
+// Gram-Schmidt orthogonalization of tangent against unit normal, returning a unit tangent perpendicular to normal
+// tangent can be zero or parallel to normal, for example when MikkTSpace falls back to the default tangent (1, 0, 0) for triangles with degenerate UVs;
+// normalizing the projection would then produce NaN, so any unit vector perpendicular to normal is returned instead
+fn orthonormal_tangent(tangent: vec3f, normal: vec3f) -> vec3f {
+    let projected = tangent - dot(normal, tangent) * normal;
+    let length_squared = dot(projected, projected);
+    if length_squared > 1e-12 {
+        return projected * inverseSqrt(length_squared);
+    }
+    // "Building an Orthonormal Basis, Revisited" by Duff et al. (2017)
+    // https://jcgt.org/published/0006/01/01/paper.pdf
+    let s = select(-1.0, 1.0, normal.z >= 0.0);
+    let a = -1.0 / (s + normal.z);
+    return vec3f(fma(s * normal.x * normal.x, a, 1.0), s * normal.x * normal.y * a, -s * normal.x);
+}
+
 fn fifth_power(x: f32) -> f32 {
     return x * x * x * x * x;
 }
@@ -978,12 +994,7 @@ fn compute_main(@builtin(global_invocation_id) global_id: vec3u) {
         var N = normalize(hit_u * n0 + hit_v * n1 + hit_w * n2) * back_face_multiplier; // should be safe
 
         // T should also be multiplied by back_face_multiplier
-        var T = normalize(hit_u * attr.t0.xyz + hit_v * attr.t1.xyz + hit_w * attr.t2.xyz) * back_face_multiplier; // should be safe
-
-        // Gram-Schmidt orthogonalization
-        // length(T - dot(N, T) * N) = 0 happens when T = 0 or when T and N are parallel; neither should ever be the case
-        // so, no need to check for division by zero for this normalization
-        T = normalize(T - dot(N, T) * N);
+        var T = orthonormal_tangent(hit_u * attr.t0.xyz + hit_v * attr.t1.xyz + hit_w * attr.t2.xyz, N) * back_face_multiplier;
 
         var B = cross(N, T) * attr.t0.w * back_face_multiplier;
         // no normalization needed since the cross product of two unit, orthogonal vectors always produces a unit vector
@@ -1056,8 +1067,7 @@ fn compute_main(@builtin(global_invocation_id) global_id: vec3u) {
 
         if N_changed {
             // re-orthogonalize since N changed
-            // division by zero happens if the new N is parallel to T
-            T = normalize(T - dot(N, T) * N);
+            T = orthonormal_tangent(T, N);
             B = cross(N, T) * attr.t0.w * back_face_multiplier;
         }
 
