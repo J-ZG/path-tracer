@@ -248,14 +248,18 @@ pub(super) fn run_base(
                     world.edit_camera(|camera| {
                         ui.collapsing("Camera", |ui| {
                             let pos = prepared_camera.position();
-                            ui.label(format!(
-                                "({:.2}, {:.2}, {:.2})  ↔ {:.2}  ↕{:.2}",
-                                pos.x,
-                                pos.y,
-                                pos.z,
-                                prepared_camera.yaw(),
-                                prepared_camera.pitch(),
-                            ));
+                            ui.add(
+                                // extend instead of wrap, so the base UI widens to fit the line
+                                egui::Label::new(format!(
+                                    "({:.2}, {:.2}, {:.2})  ↔ {:.1}°  ↕ {:.1}°",
+                                    pos.x,
+                                    pos.y,
+                                    pos.z,
+                                    prepared_camera.yaw().to_degrees(),
+                                    prepared_camera.pitch().to_degrees(),
+                                ))
+                                .extend(),
+                            );
 
                             // fov
                             let mut fov_deg = camera.fov().to_degrees();
