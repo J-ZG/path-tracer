@@ -1,32 +1,19 @@
-//! Define the [`State`] struct which encapsulates all the GPU resources, world data, and application state needed for rendering.
+//! The interactive mode: a window where the user explores and edits the world while samples accumulate.
 //!
-//! Includes methods for initializing these resources and handling events from the window.
-
-/// The name of the glTF 2.0 .glb file to load from the [`assets/glb/`](https://github.com/j-zg/path-tracer/tree/main/assets/glb) directory to render by default.
-///
-/// Can be exported from Blender.
-/// ![Export glTF from Blender 1](https://raw.githubusercontent.com/j-zg/path-tracer/main/doc/blender_export_gltf_1.jpg)
-/// ![Export glTF from Blender 2](https://raw.githubusercontent.com/j-zg/path-tracer/main/doc/blender_export_gltf_2.jpg)
-/// Be sure to check `Include > Custom Properties` and `Mesh > Apply Modifiers`.
-const DEFAULT_SCENE: &str = "box.glb";
-
-/// The name of the skybox file to load from the [`assets/skybox/`](https://github.com/j-zg/path-tracer/tree/main/assets/skybox) directory to render by default.
-const DEFAULT_SKYBOX: &str = "kloppenheim_06_puresky_2k.hdr"; // https://polyhaven.com/a/kloppenheim_06_puresky
+//! [`State`] uses a [`PathTracer`] whose tile covers the whole window, tracing one sample and displaying the tile to the window's surface every frame.
+//! On native, the headless mode is the other user of [`PathTracer`], rendering an image to a file instead.
 
 /// Supported file extensions for the scene.
 const SCENE_EXTS: &[&str] = &["glb"];
 /// Supported file extensions for the skybox.
 const SKYBOX_EXTS: &[&str] = &["exr", "hdr", "jpeg", "jpg", "png", "webp"];
 
-#[cfg(target_arch = "wasm32")]
-use anyhow::Context;
-
-use super::gpu_world::GpuWorld;
+use super::path_tracer::PathTracer;
 use super::ui;
 use super::world::World;
 
-/// Encapsulates all the GPU resources, world data, and application state.
-pub struct State {
+/// State of the interactive mode: the window's surface, the UI, the editable world, and the GPU resources for tracing and displaying it.
+pub(crate) struct State {
     /// Represents the window or canvas that will be rendered onto.
     surface: wgpu::Surface<'static>,
     /// Describes the configuration of the surface, including format, size, etc. Needed for configuring the surface and recreating it on resize.
@@ -35,28 +22,8 @@ pub struct State {
     device: wgpu::Device,
     /// Used to execute recorded [`wgpu::CommandBuffer`] objects.
     queue: wgpu::Queue,
-
-    /// Bind group 0 for the compute shader, containing the storage texture and accumulation buffer that are written to by the compute shader.
-    compute_0_bind_group: wgpu::BindGroup,
-    /// Bind group 0 for the render shader, containing just the storage texture read from by the fragment shader.
-    render_0_bind_group: wgpu::BindGroup,
-    /// Bind group layout for [`State::compute_0_bind_group`], needed here to recreate the bind group on window resizes.
-    compute_0_bind_group_layout: wgpu::BindGroupLayout,
-    /// Bind group layout for [`State::render_0_bind_group`], needed here to recreate the bind group on window resizes.
-    render_0_bind_group_layout: wgpu::BindGroupLayout,
-
-    /// Manages GPU resources associated with [`Self::world`].
-    ///
-    /// Contains bind group 1 and its layout for the compute shader, containing world data. Also contains [`wgpu::Buffer`]s and [`wgpu::Sampler`]s.
-    /// This bind group is separated from bind group 0 because this group is recreated only when data like the scene or skybox reload.
-    gpu_world: GpuWorld,
-    /// Written every frame for accumulation and RNG seeding.
-    frame_count_buffer: wgpu::Buffer,
-
-    /// Runs the compute shader.
-    compute_pipeline: wgpu::ComputePipeline,
-    /// Runs the vertex and fragment shaders.
-    render_pipeline: wgpu::RenderPipeline,
+    /// Traces paths of [`Self::world`] for the whole window, and displays the result.
+    path_tracer: PathTracer,
 
     /// Manages world data.
     world: World,
@@ -68,12 +35,6 @@ pub struct State {
     ///
     /// Using [`web_time::Instant`] which is a cross-platform abstraction over [`std::time::Instant`] that works on both native and web targets.
     last_instant: web_time::Instant,
-
-    /// Tracks the number of frames rendered since the last camera movement or window resize.
-    ///
-    /// Used for accumulation in the compute shader, where the shader can use this count to determine how many frames have been accumulated so far and adjust its calculations accordingly.
-    /// Note that when the shader gets this value (via [`wgpu::Queue::write_buffer()`]), it's always at least `1`.
-    frame_count: u32,
 
     /// Whether to show the UI overlay.
     show_ui: bool,
@@ -120,7 +81,7 @@ enum UploadedFile {
 
 impl State {
     /// Create a new [`State`].
-    #[allow(clippy::future_not_send)]
+    #[expect(clippy::future_not_send)]
     pub(crate) async fn new(
         window: std::sync::Arc<winit::window::Window>,
         display_handle: winit::event_loop::OwnedDisplayHandle,
@@ -173,23 +134,7 @@ impl State {
             color_space: wgpu::SurfaceColorSpace::Auto,
         };
 
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: Some(&surface),
-                force_fallback_adapter: false,
-                apply_limit_buckets: false,
-            })
-            .await?;
-
-        let supported_limits = adapter.limits(); // get the maximum limits the physical hardware supports
-
-        log::info!(
-            "Using adapter: {}\nMax storage buffer binding size: {} MiB\nMax texture dimension 2D: {}",
-            adapter.get_info().name,
-            supported_limits.max_storage_buffer_binding_size as f32 / 1024.0 / 1024.0,
-            supported_limits.max_texture_dimension_2d
-        );
+        let adapter = super::gpu::request_adapter(&instance, Some(&surface)).await?;
 
         // see which TextureFormat's are supported by the surface
         // Bgra8Unorm and Bgra8UnormSrgb should be guaranteed, but on web, Bgra8UnormSrgb isn't supported it seems
@@ -200,28 +145,7 @@ impl State {
             surface.get_capabilities(&adapter).formats
         );
 
-        #[cfg(all(feature = "testing", not(target_arch = "wasm32")))]
-        let required_features = (adapter.features()
-            & wgpu_profiler::GpuProfiler::ALL_WGPU_TIMER_FEATURES) // for wgpu_profiler
-            | wgpu::Features::FLOAT32_FILTERABLE; // highly supported: https://web3dsurvey.com/webgpu/features/float32-filterable
-        #[cfg(not(all(feature = "testing", not(target_arch = "wasm32"))))]
-        let required_features = wgpu::Features::FLOAT32_FILTERABLE;
-
-        let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor {
-                label: Some("Device"),
-                required_features,
-                required_limits: wgpu::Limits {
-                    max_storage_buffer_binding_size: supported_limits
-                        .max_storage_buffer_binding_size, // the default is 128 MiB, which is too small for millions of triangles
-                    max_buffer_size: supported_limits.max_buffer_size,
-                    ..wgpu::Limits::default()
-                },
-                experimental_features: unsafe { wgpu::ExperimentalFeatures::enabled() },
-                memory_hints: wgpu::MemoryHints::Performance,
-                trace: wgpu::Trace::Off,
-            })
-            .await?;
+        let (device, queue) = super::gpu::request_device(&adapter).await?;
 
         // update() only works when the surface is configured
         // update() is often called right after new(), and resize() isn't called unless a resize happens, so configuring surface here is necessary
@@ -244,72 +168,12 @@ impl State {
             &queue,
         )?;
 
-        // group 0 layout for compute shader: storage texture and accumulation buffer
-        let compute_0_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("Compute bind group 0 layout"),
-                entries: &[
-                    // storage texture
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0, // matches with @binding(0)
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::StorageTexture {
-                            access: wgpu::StorageTextureAccess::WriteOnly,
-                            format: wgpu::TextureFormat::Rgba32Float,
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                        },
-                        count: None,
-                    },
-                    // accumulation buffer
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: false },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                ],
-            });
-
-        // group 0 layout for fragment shader: just storage texture
-        let render_0_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("Render bind group 0 layout"),
-                entries: &[wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        // TextureFormat::Rgba32Float is not filterable without FLOAT32_FILTERABLE feature, also meaning that a sampler cannot be used
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                }],
-            });
-
-        // group 1 layout for compute shader: world data
-        let compute_1_bind_group_layout = GpuWorld::layout(&device);
-
-        // get bind groups for group 0
-        let (compute_0_bind_group, render_0_bind_group) = Self::create_0_bind_groups(
-            &device,
-            &compute_0_bind_group_layout,
-            &render_0_bind_group_layout,
-            &(surface_config.width, surface_config.height),
-        );
-
-        // before getting world and gpu_world, we need to get bytes for the default scene and skybox first
+        // before getting world and path_tracer, we need to get bytes for the default scene and skybox first
         // on both native and wasm, loading files is at runtime, which allows files to change without having to rebuild the WASM
-        let glb_path = format!("assets/glb/{DEFAULT_SCENE}");
-        let skybox_path = format!("assets/skybox/{DEFAULT_SKYBOX}");
-        #[allow(unused_mut)]
-        let mut glb_bytes;
-        #[allow(unused_mut)]
-        let mut skybox_bytes;
+        let glb_path = super::DEFAULT_SCENE;
+        let skybox_path = super::DEFAULT_SKYBOX;
+        let glb_bytes;
+        let skybox_bytes;
         #[cfg(not(target_arch = "wasm32"))]
         {
             glb_bytes = std::fs::read(glb_path)?;
@@ -317,22 +181,20 @@ impl State {
         }
         #[cfg(target_arch = "wasm32")]
         {
-            use wasm_bindgen::JsCast; // trait for dyn_into()
-
             async fn fetch_bytes(url: &str) -> anyhow::Result<Vec<u8>> {
-                let response: web_sys::Response = wasm_bindgen_futures::JsFuture::from(
+                let response = wasm_bindgen_futures::JsFuture::from(
                     web_sys::window()
-                        .context("get web_sys window failed")?
+                        .ok_or_else(|| anyhow::anyhow!("get web_sys window failed"))?
                         .fetch_with_str(url),
                 )
                 .await
-                .map_err(|e| anyhow::anyhow!("error fetching {url}: {e:?}"))?
-                .dyn_into()
-                .map_err(|e| {
-                    anyhow::anyhow!(
-                        "failed to cast resolved fetch response to web_sys::Response: {e:?}"
-                    )
-                })?;
+                .map_err(|e| anyhow::anyhow!("error fetching {url}: {e:?}"))?;
+                let response = wasm_bindgen::JsCast::dyn_into::<web_sys::Response>(response)
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "failed to cast resolved fetch response to web_sys::Response: {e:?}"
+                        )
+                    })?;
 
                 if !response.ok() {
                     anyhow::bail!(
@@ -356,8 +218,8 @@ impl State {
                 Ok(bytes)
             }
 
-            glb_bytes = fetch_bytes(&glb_path).await?;
-            skybox_bytes = fetch_bytes(&skybox_path).await?;
+            glb_bytes = fetch_bytes(glb_path).await?;
+            skybox_bytes = fetch_bytes(skybox_path).await?;
         }
 
         let mut world = World::new(
@@ -365,88 +227,14 @@ impl State {
             &skybox_bytes,
             surface_config.width as f32 / surface_config.height as f32,
         )?;
-        world.edit_skybox_average_luminance(8000.0); // the default skybox is unrealistically dim
-        use wgpu::util::DeviceExt;
-        let frame_count_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Frame count"),
-            contents: bytemuck::bytes_of(&1u32),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
-        let gpu_world = GpuWorld::new(
+        world.edit_skybox_average_luminance(super::world::DEFAULT_SKYBOX_LUMINANCE);
+        let path_tracer = PathTracer::new(
             &device,
             &queue,
-            compute_1_bind_group_layout.clone(),
-            &frame_count_buffer,
             world.take_updates(),
+            [surface_config.width, surface_config.height],
+            surface_config.format,
         )?;
-
-        // configure compute and render pipelines with the bind group layouts and shader modules
-
-        // create a shader module from vertex_fragment.wgsl
-        // used for vertex and fragment
-        let vertex_fragment_shader =
-            device.create_shader_module(wgpu::include_wgsl!("vertex_fragment.wgsl"));
-
-        let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("Compute pipeline"),
-            layout: Some(
-                &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("Compute pipeline layout"),
-                    bind_group_layouts: &[
-                        Some(&compute_0_bind_group_layout),
-                        Some(&compute_1_bind_group_layout),
-                    ],
-                    immediate_size: 0,
-                }),
-            ),
-            module: &device.create_shader_module(wgpu::include_wgsl!("trace_paths.wgsl")),
-            entry_point: Some("compute_main"), // function name in the wgsl file
-            compilation_options: Default::default(),
-            cache: None,
-        });
-
-        let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Render pipeline"),
-            layout: Some(
-                &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("Render pipeline layout"),
-                    bind_group_layouts: &[Some(&render_0_bind_group_layout)],
-                    immediate_size: 0,
-                }),
-            ),
-            vertex: wgpu::VertexState {
-                module: &vertex_fragment_shader,
-                entry_point: Some("vs_main"), // function name in vertex_fragment.wgsl
-                compilation_options: Default::default(),
-                buffers: &[],
-            },
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList, // for ex: Vertices 0 1 2 3 4 5 create two triangles 0 1 2 and 3 4 5
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw, // ccw are front-face; right-handed coordinate system
-                cull_mode: Some(wgpu::Face::Back),
-                unclipped_depth: false,
-                polygon_mode: wgpu::PolygonMode::Fill,
-                conservative: false,
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &vertex_fragment_shader,
-                entry_point: Some("fs_main"), // function name in vertex_fragment.wgsl
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: surface_config.format, // linear gamma
-                    blend: Some(wgpu::BlendState {
-                        color: wgpu::BlendComponent::REPLACE,
-                        alpha: wgpu::BlendComponent::REPLACE,
-                    }),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
 
         let (file_sender, file_receiver) = std::sync::mpsc::channel();
 
@@ -455,25 +243,13 @@ impl State {
             surface_config,
             device,
             queue,
-
-            compute_0_bind_group,
-            render_0_bind_group,
-            compute_0_bind_group_layout,
-            render_0_bind_group_layout,
-
-            gpu_world,
-            frame_count_buffer,
-
-            compute_pipeline,
-            render_pipeline,
+            path_tracer,
 
             world,
 
             user_mode: UserMode::CursorFree,
 
             last_instant: web_time::Instant::now(),
-
-            frame_count: 0,
 
             show_ui: true,
 
@@ -493,80 +269,6 @@ impl State {
 
             window,
         })
-    }
-
-    /// Create or recreate the storage texture, accumulation buffer, and their corresponding bind groups for both compute and render pipelines.
-    /// Called on window resizes since the surface size changes.
-    /// Returns the compute and render bind groups, respectively.
-    fn create_0_bind_groups(
-        device: &wgpu::Device,
-        compute_layout: &wgpu::BindGroupLayout,
-        render_layout: &wgpu::BindGroupLayout,
-        texture_size: &(u32, u32),
-    ) -> (wgpu::BindGroup, wgpu::BindGroup) {
-        let storage_texture_view = device
-            .create_texture(&wgpu::TextureDescriptor {
-                label: Some("Storage texture"),
-                size: wgpu::Extent3d {
-                    width: texture_size.0,
-                    height: texture_size.1,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1, // the different "sizes" of the image for rendering at different distances; not necessary here since the texture is full screen and doesn't need to be rendered at different sizes
-                sample_count: 1,    // multisampling for anti-aliasing (MSAA); not necessary here
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba32Float,
-                usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
-                view_formats: &[wgpu::TextureFormat::Rgba32Float],
-            })
-            .create_view(&wgpu::TextureViewDescriptor {
-                label: Some("Storage texture view"),
-                format: Some(wgpu::TextureFormat::Rgba32Float),
-                dimension: Some(wgpu::TextureViewDimension::D2),
-                aspect: wgpu::TextureAspect::All,
-                base_mip_level: 0,
-                mip_level_count: Some(1),
-                ..Default::default()
-            });
-
-        let accumulation_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Accumulation"), // this is actually used as a texture, but since textures cannot be both read and write, a storage buffer is used instead
-            size: wgpu::BufferAddress::from(
-                texture_size.0 * texture_size.1 * 16, // 16 bytes per pixel for vec4<f32>
-            ),
-            usage: wgpu::BufferUsages::STORAGE,
-            mapped_at_creation: false,
-        });
-
-        #[cfg(all(feature = "testing", not(target_arch = "wasm32")))]
-        log::info!("Accumulation buffer size: {}", accumulation_buffer.size());
-
-        (
-            device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("Compute bind group 0"),
-                layout: compute_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&storage_texture_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Buffer(
-                            accumulation_buffer.as_entire_buffer_binding(),
-                        ),
-                    },
-                ],
-            }),
-            device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("Render bind group 0"),
-                layout: render_layout,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0, // matches with @binding(0)
-                    resource: wgpu::BindingResource::TextureView(&storage_texture_view),
-                }],
-            }),
-        )
     }
 
     /// Use [`rfd`] to allow file picking on both native and web.
@@ -612,26 +314,23 @@ impl State {
     }
 
     /// Handle window resizes by reconfiguring the surface,
-    /// recreating the storage texture and accumulation buffer,
-    /// recreating their bind groups [`State::compute_0_bind_group`] and [`State::render_0_bind_group`],
+    /// resizing the tile of [`Self::path_tracer`] to the new surface size,
     /// and changing the camera aspect ratio to match the new surface size.
     pub(crate) fn resize(&mut self, width: u32, height: u32) {
         #[cfg(all(feature = "testing", not(target_arch = "wasm32")))]
         log::info!("Resize {width}x{height}");
 
         if width > 0 && height > 0 {
+            if let Err(error) =
+                self.path_tracer
+                    .set_tile(&self.device, [width, height], [0, 0], [width, height])
+            {
+                log::error!("Failed to resize the path tracer: {error:#}");
+                return;
+            }
             self.surface_config.width = width;
             self.surface_config.height = height;
             self.surface.configure(&self.device, &self.surface_config);
-            self.frame_count = 0;
-
-            // recreating bind group 0 is necessary for a resize since storage texture size must match the surface size
-            (self.compute_0_bind_group, self.render_0_bind_group) = Self::create_0_bind_groups(
-                &self.device,
-                &self.compute_0_bind_group_layout,
-                &self.render_0_bind_group_layout,
-                &(width, height),
-            );
 
             self.world
                 .edit_camera(|camera| camera.resize((width as f32) / (height as f32)));
@@ -686,13 +385,15 @@ impl State {
                 }
 
                 let is_hovering = !raw_input.hovered_files.is_empty();
+                let mut max_bounces = self.path_tracer.max_bounces();
                 let mut full_output = self.egui_context.run_ui(raw_input, |root_ui| {
                     if self.show_ui {
                         for action in ui::run_base(
                             root_ui,
                             &mut self.world,
+                            &mut max_bounces,
                             dt,
-                            self.frame_count,
+                            self.path_tracer.sample_count(),
                             &self.file_upload_status,
                             is_hovering,
                         ) {
@@ -745,22 +446,12 @@ impl State {
                     UserMode::CursorFree => {}
                 }
 
-                let updates = self.world.take_updates();
-                if updates.reset_accumulation {
-                    self.frame_count = 0;
-                }
-                self.gpu_world
-                    .apply_updates(&self.device, &self.queue, updates);
-
-                self.frame_count += 1; // note that frame_count is incremented every frame, after any reset to 0
-
-                self.queue.write_buffer(
-                    // write_buffer happens after the increment
-                    &self.frame_count_buffer,
-                    0,
-                    bytemuck::bytes_of(&(self.frame_count)),
-                ); // so for in the compute shader, frame_count is always at least 1
-                // only when frame_count > 1 will the compute shader write to the accumulation buffer (the initial frame needs to overwrite the accumulation buffer instead of accumulating with a nonexistent previous frame)
+                self.path_tracer.set_max_bounces(max_bounces);
+                self.path_tracer.apply_updates(
+                    &self.device,
+                    &self.queue,
+                    self.world.take_updates(),
+                );
 
                 // tesselate full_output.shapes into a vec of triangles
                 let paint_jobs = self
@@ -831,7 +522,7 @@ impl State {
                     &screen_descriptor,
                 );
 
-                // compute pass
+                // trace pass
 
                 // for wgpu_profiler, not using the auto-closing profiler.scope() -> Scope<'a, Recorder> because scope.scoped_render_pass() returns OwningScope<'_, RenderPass<'_>>, not the normal RenderPass
                 // same for scope.scoped_compute_pass(), returning OwningScope<'_, ComputePass<'_>>
@@ -840,34 +531,27 @@ impl State {
                 #[cfg(all(feature = "testing", not(target_arch = "wasm32")))]
                 let outer_query = self
                     .profiler
-                    .begin_query("Compute and render scope", &mut encoder);
+                    .begin_query("Trace and display scope", &mut encoder);
 
                 #[cfg(all(feature = "testing", not(target_arch = "wasm32")))]
                 let compute_query = self
                     .profiler
-                    .begin_pass_query("Compute pass scoped", &mut encoder)
+                    .begin_pass_query("Trace pass scoped", &mut encoder)
                     .with_parent(Some(&outer_query)); // make compute_query a child of outer_query
 
                 #[cfg(all(feature = "testing", not(target_arch = "wasm32")))]
                 let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("Compute pass"),
+                    label: Some("Trace pass"),
                     timestamp_writes: compute_query.compute_pass_timestamp_writes(),
                 });
 
                 #[cfg(not(all(feature = "testing", not(target_arch = "wasm32"))))]
                 let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("Compute pass"),
+                    label: Some("Trace pass"),
                     timestamp_writes: None,
                 });
 
-                compute_pass.set_pipeline(&self.compute_pipeline);
-                compute_pass.set_bind_group(0, &self.compute_0_bind_group, &[]); // the u32 passed here, which is 0, matches with @group(0)
-                compute_pass.set_bind_group(1, &self.gpu_world.bind_group, &[]);
-                compute_pass.dispatch_workgroups(
-                    self.surface_config.width.div_ceil(8),
-                    self.surface_config.height.div_ceil(8),
-                    1,
-                );
+                self.path_tracer.trace(&self.queue, &mut compute_pass, 1);
 
                 drop(compute_pass); // avoid multiple &mut to encoder
 
@@ -875,7 +559,7 @@ impl State {
                 #[cfg(all(feature = "testing", not(target_arch = "wasm32")))]
                 self.profiler.end_query(&mut encoder, compute_query);
 
-                // render pass
+                // display pass
 
                 // create a reusable frame texture view to avoid creating it redundantly across the two render passes
                 let frame_view = frame.texture.create_view(&wgpu::TextureViewDescriptor {
@@ -889,7 +573,7 @@ impl State {
                 });
 
                 let render_pass_descriptor = wgpu::RenderPassDescriptor {
-                    label: Some("Render pass"),
+                    label: Some("Display pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                         view: &frame_view,
                         depth_slice: None, // only useful for 3D textures
@@ -908,7 +592,7 @@ impl State {
                 #[cfg(all(feature = "testing", not(target_arch = "wasm32")))]
                 let render_query = self
                     .profiler
-                    .begin_pass_query("Render pass scoped", &mut encoder)
+                    .begin_pass_query("Display pass scoped", &mut encoder)
                     .with_parent(Some(&outer_query));
 
                 #[cfg(all(feature = "testing", not(target_arch = "wasm32")))]
@@ -924,9 +608,7 @@ impl State {
                     .begin_render_pass(&render_pass_descriptor)
                     .forget_lifetime();
 
-                render_pass.set_pipeline(&self.render_pipeline);
-                render_pass.set_bind_group(0, &self.render_0_bind_group, &[]);
-                render_pass.draw(0..3, 0..1); // draw a triangle (full-screen triangle)
+                self.path_tracer.display(&mut render_pass);
 
                 // egui render pass, using the same render_pass RenderPass<'_>
                 self.egui_wgpu_renderer
@@ -1024,7 +706,7 @@ impl State {
         }
     }
 
-    /// Handle mouse movement events to rotate the camera when the cursor is locked, and reset the frame count for accumulation when the camera moves.
+    /// Handle mouse movement events to rotate the camera when the cursor is locked.
     pub(crate) fn mouse_move_event(&mut self, delta: (f64, f64)) {
         if matches!(&self.user_mode, UserMode::CursorGrabbed(_)) {
             self.world

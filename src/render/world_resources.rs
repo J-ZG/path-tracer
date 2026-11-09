@@ -1,11 +1,11 @@
-//! GPU resources associated with [`super::world`].
+//! GPU resources associated with [`world`].
 
 use super::world;
 
-// TODO: finish docs
-
-/// Contains all GPU resources associated with [`super::world`].
-pub(super) struct GpuWorld {
+/// Contains all GPU resources associated with [`world`].
+///
+/// Contains bind group 1 of the trace pipeline and its layout and bindings.
+pub(super) struct WorldResources {
     pub(super) bind_group: wgpu::BindGroup,
     layout: wgpu::BindGroupLayout,
     bindings: WorldBindings,
@@ -21,8 +21,6 @@ struct WorldBindings {
     scene_linear_texture_atlases: wgpu::TextureView,
     atlas_sampler: wgpu::Sampler,
     camera: wgpu::Buffer,
-    /// Shared handle to the buffer controlled by the caller of this module; cloning does not copy GPU data.
-    frame_count: wgpu::Buffer,
     skybox_texture: wgpu::TextureView,
     skybox_uniforms: wgpu::Buffer,
     skybox_sampler: wgpu::Sampler,
@@ -159,6 +157,7 @@ impl SceneResources {
 
         let alias_table = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Scene aliases"),
+            // size capable of holding all triangles to accommodate the case where every triangle was emissive (since the user can modify emissivity during runtime in the UI)
             size: (scene.geometries.len() * std::mem::size_of::<world::GpuSceneAliasEntry>())
                 as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
@@ -246,12 +245,10 @@ impl SkyboxResources {
     }
 }
 
-impl GpuWorld {
+impl WorldResources {
     pub(super) fn layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
-        // group 1 layout for compute shader: world data
-
         device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Compute bind group 1 layout"),
+            label: Some("World bind group layout"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0, // geometries
@@ -333,17 +330,7 @@ impl GpuWorld {
                     count: None,
                 },
                 wgpu::BindGroupLayoutEntry {
-                    binding: 8, // frame count
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: std::num::NonZeroU64::new(4),
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 9, // skybox texture
+                    binding: 8, // skybox texture
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Float { filterable: true }, // feature FLOAT32_FILTERABLE is enabled, so this texture can be filtered
@@ -353,7 +340,7 @@ impl GpuWorld {
                     count: None,
                 },
                 wgpu::BindGroupLayoutEntry {
-                    binding: 10, // skybox uniforms
+                    binding: 9, // skybox uniforms
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
@@ -363,13 +350,13 @@ impl GpuWorld {
                     count: None,
                 },
                 wgpu::BindGroupLayoutEntry {
-                    binding: 11, // skybox sampler
+                    binding: 10, // skybox sampler
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
                 wgpu::BindGroupLayoutEntry {
-                    binding: 12, // scene uniforms
+                    binding: 11, // scene uniforms
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
@@ -379,7 +366,7 @@ impl GpuWorld {
                     count: None,
                 },
                 wgpu::BindGroupLayoutEntry {
-                    binding: 13, // scene alias table
+                    binding: 12, // scene alias table
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Storage { read_only: true },
@@ -389,7 +376,7 @@ impl GpuWorld {
                     count: None,
                 },
                 wgpu::BindGroupLayoutEntry {
-                    binding: 14, // skybox alias table
+                    binding: 13, // skybox alias table
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Storage { read_only: true },
@@ -408,7 +395,6 @@ impl WorldBindings {
     fn new(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        frame_count: &wgpu::Buffer,
         updates: world::WorldUpdates,
     ) -> anyhow::Result<Self> {
         use anyhow::Context;
@@ -436,16 +422,18 @@ impl WorldBindings {
             &[updates.camera.context("initial camera upload missing")?],
             wgpu::BufferUsages::UNIFORM,
         );
-        let (scene_data, aliases) = updates
-            .scene_lighting
-            .context("initial scene lighting missing")?;
+        let aliases = updates
+            .scene_alias_table
+            .context("initial scene aliases missing")?;
         if !aliases.is_empty() {
             queue.write_buffer(&scene.alias_table, 0, bytemuck::cast_slice(aliases));
         }
         let scene_uniforms = buffer(
             device,
             "Scene uniforms",
-            &[scene_data],
+            &[updates
+                .scene_uniforms
+                .context("initial scene uniforms missing")?],
             wgpu::BufferUsages::UNIFORM,
         );
         let skybox_uniforms = buffer(
@@ -476,7 +464,6 @@ impl WorldBindings {
             scene_linear_texture_atlases: scene.linear_texture_atlases,
             atlas_sampler,
             camera,
-            frame_count: frame_count.clone(),
             skybox_texture: skybox.rgba,
             skybox_uniforms,
             skybox_sampler,
@@ -486,7 +473,9 @@ impl WorldBindings {
         })
     }
 
-    // returns a new bind group is needed
+    /// Apply updates given a [`world::WorldUpdates`].
+    ///
+    /// Returns whether the bind group needs to be recreated.
     fn apply_updates(
         &mut self,
         device: &wgpu::Device,
@@ -520,11 +509,13 @@ impl WorldBindings {
                 bytemuck::bytes_of(&material),
             );
         }
-        if let Some((uniforms, aliases)) = updates.scene_lighting {
+        if let Some(uniforms) = updates.scene_uniforms {
             queue.write_buffer(&self.scene_uniforms, 0, bytemuck::bytes_of(&uniforms));
-            if !aliases.is_empty() {
-                queue.write_buffer(&self.scene_alias_table, 0, bytemuck::cast_slice(aliases));
-            }
+        }
+        if let Some(aliases) = updates.scene_alias_table
+            && !aliases.is_empty()
+        {
+            queue.write_buffer(&self.scene_alias_table, 0, bytemuck::cast_slice(aliases));
         }
         if let Some(uniforms) = updates.skybox_uniforms {
             queue.write_buffer(&self.skybox_uniforms, 0, bytemuck::bytes_of(&uniforms));
@@ -539,7 +530,7 @@ impl WorldBindings {
         layout: &wgpu::BindGroupLayout,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Compute bind group 1"),
+            label: Some("World bind group"),
             layout,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -578,30 +569,26 @@ impl WorldBindings {
                 },
                 wgpu::BindGroupEntry {
                     binding: 8,
-                    resource: self.frame_count.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 9,
                     resource: wgpu::BindingResource::TextureView(&self.skybox_texture),
                 },
                 wgpu::BindGroupEntry {
-                    binding: 10,
+                    binding: 9,
                     resource: self.skybox_uniforms.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
-                    binding: 11,
+                    binding: 10,
                     resource: wgpu::BindingResource::Sampler(&self.skybox_sampler),
                 },
                 wgpu::BindGroupEntry {
-                    binding: 12,
+                    binding: 11,
                     resource: self.scene_uniforms.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
-                    binding: 13,
+                    binding: 12,
                     resource: self.scene_alias_table.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
-                    binding: 14,
+                    binding: 13,
                     resource: self.skybox_alias_table.as_entire_binding(),
                 },
             ],
@@ -609,15 +596,51 @@ impl WorldBindings {
     }
 }
 
-impl GpuWorld {
+impl WorldResources {
     pub(super) fn new(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         layout: wgpu::BindGroupLayout,
-        frame_count: &wgpu::Buffer,
         updates: world::WorldUpdates,
     ) -> anyhow::Result<Self> {
-        let bindings = WorldBindings::new(device, queue, frame_count, updates)?;
+        // validate before allocating, so that oversized worlds fail with an error instead of a GPU validation panic
+        let limits = device.limits();
+        let check_buffer = |bytes: usize| -> anyhow::Result<()> {
+            anyhow::ensure!(
+                bytes as u64 <= limits.max_buffer_size
+                    && bytes as u64 <= limits.max_storage_buffer_binding_size,
+                "world storage buffer ({bytes} bytes) exceeds GPU limits"
+            );
+            Ok(())
+        };
+        if let Some(scene) = &updates.scene {
+            check_buffer(std::mem::size_of_val(scene.geometries))?;
+            check_buffer(std::mem::size_of_val(scene.attributes))?;
+            check_buffer(std::mem::size_of_val(scene.materials))?;
+            check_buffer(std::mem::size_of_val(scene.bvh_nodes))?;
+            anyhow::ensure!(
+                world::ATLAS_SIZE <= limits.max_texture_dimension_2d,
+                "scene texture atlas dimensions exceed GPU limits"
+            );
+            for atlases in [scene.srgb_texture_atlases, scene.linear_texture_atlases] {
+                anyhow::ensure!(
+                    atlases.len() as u64 <= u64::from(limits.max_texture_array_layers),
+                    "scene texture atlas layers exceed GPU limits"
+                );
+            }
+        }
+        if let Some(skybox) = &updates.skybox {
+            anyhow::ensure!(
+                skybox.uniforms.width <= limits.max_texture_dimension_2d
+                    && skybox.uniforms.height <= limits.max_texture_dimension_2d,
+                "skybox dimensions exceed GPU limits"
+            );
+            check_buffer(std::mem::size_of_val(skybox.alias_table))?;
+        }
+        if let Some(alias_table) = updates.scene_alias_table {
+            check_buffer(std::mem::size_of_val(alias_table))?;
+        }
+        let bindings = WorldBindings::new(device, queue, updates)?;
         Ok(Self {
             bind_group: bindings.create_bind_group(device, &layout),
             layout,

@@ -1,4 +1,4 @@
-// use a full-screen triangle to display the output texture, and sample from the texture in the fragment shader to apply tone mapping and sRGB gamma correction
+// use a full-screen triangle to display the storage texture, and sample from the texture in the fragment shader to apply tone mapping and sRGB gamma correction
 // full-screen triangle is more efficient than rendering a quad with two triangles, and avoids issues with interpolation at the edges of the quad.
 
 @vertex
@@ -11,7 +11,8 @@ fn vs_main(@builtin(vertex_index) vert_index: u32) -> @builtin(position) vec4f {
     return vec4f(pos[vert_index], 0.0, 1.0);
 }
 
-@group(0) @binding(0) var output_texture: texture_2d<f32>;
+// group 0: display bind group
+@group(0) @binding(0) var storage_texture: texture_2d<f32>;
 
 // ACES filmic tone mapping approximation
 // see https://knarkowicz.wordpress.com/2016/01/06/aces-filmic-tone-mapping-curve/
@@ -29,7 +30,7 @@ fn aces_film(color: vec3f) -> vec3f { // TODO: AgX may be better?
 
 @fragment
 fn fs_main(@builtin(position) frag_position: vec4f) -> @location(0) vec4f {
-    let color = textureLoad(output_texture, vec2i(frag_position.xy), 0); // not using textureSample since "Non-filterable float textures can't be sampled with a filtering sampler"
+    let color = textureLoad(storage_texture, vec2i(frag_position.xy), 0); // not using textureSample since "Non-filterable float textures can't be sampled with a filtering sampler"
 
     // tone mapping
     let mapped = aces_film(color.rgb);

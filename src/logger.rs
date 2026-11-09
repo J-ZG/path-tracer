@@ -2,7 +2,7 @@
 ///
 /// `detail` is converted to a [`wasm_bindgen::JsValue`].
 #[cfg(target_arch = "wasm32")]
-pub fn send_js_event(event_name: &str, detail: &str) {
+pub(super) fn send_js_event(event_name: &str, detail: &str) {
     if let Some(window) = web_sys::window() {
         let init = web_sys::CustomEventInit::new();
         init.set_detail(&wasm_bindgen::JsValue::from_str(detail));
@@ -55,7 +55,7 @@ impl log::Log for WebLogger {
 /// Initialize logging.
 ///
 /// On native, initializes `env_logger`. On the web, initializes custom logger `WebLogger`.
-pub fn init_environment(max_level: log::LevelFilter) {
+pub(super) fn init_environment(max_level: log::LevelFilter) {
     #[cfg(target_arch = "wasm32")]
     {
         std::panic::set_hook(Box::new(|panic_info| {
@@ -75,4 +75,6 @@ pub fn init_environment(max_level: log::LevelFilter) {
             .filter_level(max_level)
             .init();
     }
+
+    log::info!("Logging enabled");
 }

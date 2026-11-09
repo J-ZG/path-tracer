@@ -1,9 +1,24 @@
 //! Load, format, and manage a 3D world from a glTF 2.0 .glb file.
+//!
+//! A .glb file can be exported from Blender.
+//!
+//! Be sure to check `Include > Custom Properties` and `Mesh > Apply Modifiers`.
+//!
+//! ![Export glTF from Blender 1](https://raw.githubusercontent.com/j-zg/path-tracer/main/doc/blender_export_gltf_1.jpg)
+//! ![Export glTF from Blender 2](https://raw.githubusercontent.com/j-zg/path-tracer/main/doc/blender_export_gltf_2.jpg)
+
 // the terminology is: world = scene + skybox
 
 // some are pub instead of pub(super) or pub(crate) in this module because criterion, an external crate, is used to benchmark stuff in this module
 
 use anyhow::Context;
+
+/// Default average luminance of a skybox in nits, which is that of a clear daytime sky.
+///
+/// Skybox image files usually don't store physically based values, so the average luminance computed from an imported skybox is rarely meaningful.
+/// Set a physically based value with [`World::edit_skybox_average_luminance()`] that suits the camera exposure.
+/// This value suits the exposure from the Sunny 16 rule: aperture f/16, shutter speed 1/125 s, and ISO 100.
+pub(super) const DEFAULT_SKYBOX_LUMINANCE: f32 = 8000.0; // EXPOSURE is currently set in trace.wgsl
 
 /// The size of each texture atlas in pixels.
 ///
@@ -21,7 +36,8 @@ pub(super) const ATLAS_SIZE: u32 = 8192;
 
 // TODO: finish docs
 
-// structs are named Gpu* iff it's intended that they get directly put into bytemuck::bytes_of for the GPU
+// Rust structs use the Gpu prefix iff their bytes are uploaded to GPU buffers
+// CPU containers and resource handles do not use the prefix
 
 /// Contains world data and pending changes.
 pub(super) struct World {
@@ -52,7 +68,8 @@ pub(super) struct WorldUpdates<'a> {
     pub(super) skybox: Option<SkyboxUpload<'a>>,
     pub(super) camera: Option<GpuCamera>,
     pub(super) materials: Vec<(usize, GpuMaterial)>,
-    pub(super) scene_lighting: Option<(GpuSceneUniforms, &'a [GpuSceneAliasEntry])>,
+    pub(super) scene_uniforms: Option<GpuSceneUniforms>,
+    pub(super) scene_alias_table: Option<&'a [GpuSceneAliasEntry]>,
     pub(super) skybox_uniforms: Option<GpuSkyboxUniforms>,
     pub(super) reset_accumulation: bool,
 }
@@ -173,7 +190,7 @@ pub(super) struct GpuTriangleAttribute {
 pub(super) struct GpuMaterial {
     /// Base color in linear RGBA. Linear multiplier to the base color texture; if no texture, the base color is just this color.
     ///
-    /// Parsed from [material.pbrMetallicRoughness.baseColorTexture](https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html#_material_pbrmetallicroughness_basecolorfactor).
+    /// Parsed from [material.pbrMetallicRoughness.baseColorFactor](https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html#_material_pbrmetallicroughness_basecolorfactor).
     ///
     /// Defaults to `(1.0, 1.0, 1.0, 1.0)`; RGBA in [0, 1].
     ///
@@ -440,6 +457,25 @@ pub(super) struct GpuSceneUniforms {
     /// Estimated lumens, ignoring emission textures. Triangles emit on both sides.
     total_luminous_flux: f32,
     emissive_triangles_count: u32,
+    /// Geometry and skybox category probabilities.
+    light_probabilities: [f32; 2],
+}
+impl GpuSceneUniforms {
+    fn update_light_probabilities(&mut self, skybox_total_luminous_flux: f32) {
+        let geometry_flux = if self.emissive_triangles_count > 0 {
+            self.total_luminous_flux
+        } else {
+            0.0
+        };
+        let scale = geometry_flux.max(skybox_total_luminous_flux);
+        self.light_probabilities = if scale > 0.0 {
+            let geometry = geometry_flux / scale;
+            let skybox = skybox_total_luminous_flux / scale;
+            [geometry / (geometry + skybox), skybox / (geometry + skybox)]
+        } else {
+            [0.0; 2]
+        };
+    }
 }
 
 #[repr(C)]
@@ -739,6 +775,11 @@ impl World {
             self.skybox
                 .update_total_luminous_flux(self.scene.radius_squared());
         }
+        let scene_uniforms_changed = lighting_changed || skybox_uniforms_changed;
+        if scene_uniforms_changed {
+            self.scene_uniforms
+                .update_light_probabilities(self.skybox.uniforms.total_luminous_flux);
+        }
 
         if selection_changed {
             let camera = &self.scene.camera;
@@ -769,8 +810,8 @@ impl World {
             }),
             camera: camera_changed.then(|| self.scene.camera.gpu_camera()),
             materials,
-            scene_lighting: lighting_changed
-                .then_some((self.scene_uniforms, self.scene_alias_table.as_slice())),
+            scene_uniforms: scene_uniforms_changed.then_some(self.scene_uniforms),
+            scene_alias_table: lighting_changed.then_some(self.scene_alias_table.as_slice()),
             skybox_uniforms: skybox_uniforms_changed.then_some(self.skybox.uniforms),
             reset_accumulation,
         }
@@ -1599,7 +1640,7 @@ impl Scene {
                 .cross(geometry.v2.as_dvec3() - geometry.v0.as_dvec3())
                 .length()
                 * 0.5;
-            // trace_paths currently adds emission from both sides of every triangle.
+            // trace.wgsl currently adds emission from both sides of every triangle.
             let flux = std::f64::consts::TAU * area * emission;
             if flux > 0.0 && flux.is_finite() {
                 indices.push(index as u32);
@@ -1610,6 +1651,7 @@ impl Scene {
         let uniforms = GpuSceneUniforms {
             total_luminous_flux: (weights.iter().sum::<f64>()).min(f64::from(f32::MAX)) as f32,
             emissive_triangles_count: indices.len() as u32,
+            light_probabilities: [0.0; 2], // updated after both categories' fluxes are ready
         };
 
         let entries = alias_table(&weights)

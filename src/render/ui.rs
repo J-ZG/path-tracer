@@ -132,13 +132,14 @@ pub(super) enum BaseUiAction {
 /// Run the base UI. Should be called inside the closure for [`egui::Context::run_ui()`].
 ///
 /// `dt` is the change in time since the last frame in seconds, used to display the FPS in this UI.
-/// `frame_count` is displayed in this UI as just `{frame_count} Frames`.
+/// `sample_count` is displayed in this UI as just `{sample_count} Samples`.
 /// `upload_status`, if not empty, is displayed below the buttons for uploading files.
 pub(super) fn run_base(
     root_ui: &egui::Ui,
     world: &mut world::World,
+    max_bounces: &mut u32,
     dt: f32,
-    frame_count: u32,
+    sample_count: u32,
     upload_status: &str,
     is_hovering: bool,
 ) -> Vec<BaseUiAction> {
@@ -157,7 +158,10 @@ pub(super) fn run_base(
         .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-4.0, 0.0))
         .show(root_ui.ctx(), |ui| {
             ui.with_layout(egui::Layout::top_down(egui::Align::RIGHT), |ui| {
-                ui.monospace(format!("{frame_count} Frames\n{} FPS", dt.recip().round()))
+                ui.monospace(format!(
+                    "{sample_count} Samples\n{} FPS",
+                    dt.recip().round()
+                ))
             });
         });
 
@@ -203,7 +207,7 @@ pub(super) fn run_base(
                     let separator_y = ui.cursor().top();
                     ui.add_space(ui.spacing().item_spacing.y * 2.0);
 
-                    ui.collapsing("World", |ui| {
+                    ui.collapsing("World & Rendering", |ui| {
                         if ui.button("Upload scene").clicked() {
                             actions.push(BaseUiAction::UploadScene);
                         }
@@ -225,6 +229,17 @@ pub(super) fn run_base(
                             .changed()
                         {
                             world.edit_skybox_average_luminance(skybox_luminance);
+                        }
+
+                        use super::path_tracer::PathTracer;
+                        let response = ui.add(
+                            egui::Slider::new(max_bounces, 0..=PathTracer::MAX_BOUNCES_LIMIT)
+                                .text("Max light bounces"),
+                        );
+                        if response.drag_stopped_by(egui::PointerButton::Secondary)
+                            || response.secondary_clicked()
+                        {
+                            *max_bounces = PathTracer::DEFAULT_MAX_BOUNCES;
                         }
                     });
 

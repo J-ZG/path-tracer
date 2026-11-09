@@ -2,7 +2,7 @@
 /* eslint-disable */
 
 /**
- * The main function that runs the app, called by both native and web targets.
+ * Run the app on the web, opening the interactive window.
  */
 export function run(): void;
 

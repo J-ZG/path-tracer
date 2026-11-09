@@ -1,6 +1,4 @@
 #![cfg_attr(doc, doc = include_str!("../README.md"))]
-#![allow(clippy::expect_used)]
-#![allow(clippy::panic)]
 
 // not supported because testing includes saving images to disk
 #[cfg(all(feature = "testing", target_arch = "wasm32"))]
@@ -8,19 +6,65 @@ compile_error!("feature `testing` is not supported on wasm32");
 
 // TODO: investigate why web performance is much worse than on native
 
-pub mod render;
-// pub for criterion benchmark since criterion is an external crate
-use render::state::State;
+pub mod render; // pub for criterion benchmarks, since criterion is an external crate
+use render::interactive::State;
 
 mod logger;
 
-/// The main function that runs the app, called by both native and web targets.
+/// Interactive and headless GPU path tracer.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(clap::Parser)]
+#[command(name = "path-tracer-app", version)]
+struct Cli {
+    /// Opens the interactive window if no command is given.
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+/// Commands other than opening the interactive window.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(clap::Subcommand)]
+enum Command {
+    /// Render an image without opening an interactive window.
+    Render(render::headless::RenderOptions),
+}
+
+/// Run the app natively: open the interactive window, or run the command given on the command line.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn run() -> std::process::ExitCode {
+    logger::init_environment(log::LevelFilter::Info);
+    match <Cli as clap::Parser>::parse().command {
+        None => {
+            run_window();
+            std::process::ExitCode::SUCCESS
+        }
+        Some(Command::Render(options)) => {
+            match pollster::block_on(render::headless::render(&options)) {
+                Ok(()) => std::process::ExitCode::SUCCESS,
+                Err(error) => {
+                    log::error!("Rendering failed: {error:#}");
+                    std::process::ExitCode::FAILURE
+                }
+            }
+        }
+    }
+}
+
+/// Run the app on the web, opening the interactive window.
 // wasm_bindgen(start) marks the first function that gets executed when this code, converted to wasm, is loaded into the browser
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(start))]
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen::prelude::wasm_bindgen(start)]
 pub fn run() {
     logger::init_environment(log::LevelFilter::Info);
-    log::info!("Logging enabled");
+    run_window();
+}
 
+/// Open the interactive window and run its event loop.
+#[expect(
+    clippy::expect_used,
+    reason = "startup failures terminate the interactive app"
+)]
+fn run_window() {
     // general style guide: all logging should be capitalized, while compile_error!() panic!() .expect() .context() should not be capitalized
 
     let event_loop = winit::event_loop::EventLoop::with_user_event()
@@ -46,8 +90,7 @@ pub fn run() {
     #[cfg(target_arch = "wasm32")]
     {
         let app = App::new(&event_loop);
-        use winit::platform::web::EventLoopExtWebSys;
-        event_loop.spawn_app(app);
+        winit::platform::web::EventLoopExtWebSys::spawn_app(event_loop, app);
     }
 }
 
@@ -60,7 +103,13 @@ struct App {
 }
 
 impl App {
-    #[allow(clippy::missing_const_for_fn)] // create_proxy() isn't const
+    #[cfg_attr(
+        not(target_arch = "wasm32"),
+        expect(
+            clippy::missing_const_for_fn,
+            reason = "the web constructor creates an event loop proxy"
+        )
+    )]
     fn new(
         #[cfg(target_arch = "wasm32")] event_loop: &winit::event_loop::EventLoop<State>,
     ) -> Self {
@@ -76,32 +125,38 @@ impl winit::application::ApplicationHandler<State> for App {
     /// Initialize the application by creating a window and a [`State`].
     // called by winit when the window is resumed
     // seems to be called only once when the window is opened
+    #[expect(
+        clippy::expect_used,
+        reason = "window initialization failures terminate the interactive app"
+    )]
+    #[cfg_attr(
+        target_arch = "wasm32",
+        expect(
+            clippy::panic,
+            reason = "failure to deliver initial state prevents browser startup"
+        )
+    )]
     fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
         // resumed() has method signature that returns nothing, so anyhow cannot be used here
 
-        #[allow(unused_mut)]
-        // window_attributes doesn't have to be mut on non-wasm, but must be mut on wasm
-        let mut window_attributes = winit::window::Window::default_attributes();
+        let window_attributes = winit::window::Window::default_attributes();
 
         #[cfg(target_arch = "wasm32")]
-        {
-            use wasm_bindgen::JsCast; // needed for .dyn_into()
-            // WindowAttributesExtWebSys is a trait implemented by winit::window::WindowAttributes used for .with_canvas()
-            use winit::platform::web::WindowAttributesExtWebSys;
-
-            const CANVAS_ID: &str = "rust-insert-wasm"; // matches with index.html <canvas id="rust-insert-wasm">
-
-            window_attributes = window_attributes.with_canvas(Some(
-                web_sys::window()
-                    .expect("get web_sys window failed")
-                    .document()
-                    .expect("get web_sys document failed")
-                    .get_element_by_id(CANVAS_ID)
-                    .expect("canvas element not found in DOM")
-                    .dyn_into::<web_sys::HtmlCanvasElement>()
-                    .expect("canvas element found, but it was not an HtmlCanvasElement"),
-            ));
-        }
+        let window_attributes = {
+            const CANVAS_ID: &str = "rust-insert-wasm"; // matches index.html's canvas
+            let element = web_sys::window()
+                .expect("get web_sys window failed")
+                .document()
+                .expect("get web_sys document failed")
+                .get_element_by_id(CANVAS_ID)
+                .expect("canvas element not found in DOM");
+            let canvas = wasm_bindgen::JsCast::dyn_into::<web_sys::HtmlCanvasElement>(element)
+                .expect("canvas element found, but it was not an HtmlCanvasElement");
+            winit::platform::web::WindowAttributesExtWebSys::with_canvas(
+                window_attributes,
+                Some(canvas),
+            )
+        };
 
         let window = std::sync::Arc::new(
             event_loop
@@ -115,7 +170,7 @@ impl winit::application::ApplicationHandler<State> for App {
             // use pollster async runtime/executor to await the future from State::new(window)
             self.state = Some(
                 pollster::block_on(State::new(window, event_loop.owned_display_handle()))
-                    .expect("State::new() failed"),
+                    .expect("state initialization failed"),
             );
             // for non-wasm, this is where self.state is set, and initialization is finished
         }
@@ -128,11 +183,11 @@ impl winit::application::ApplicationHandler<State> for App {
                 wasm_bindgen_futures::spawn_local(async move {
                     let state = State::new(window, display_handle)
                         .await
-                        .expect("State::new() failed");
+                        .expect("state initialization failed");
 
                     proxy
                         .send_event(state)
-                        .unwrap_or_else(|_| panic!("send_event to EventLoopProxy failed"));
+                        .unwrap_or_else(|_| panic!("send_event to event loop proxy failed"));
                     // .expect() isn't used here since the error EventLoopClosed<T> from send_event() doesn't implement Debug (would have to derive Debug for State)
                 });
             }
