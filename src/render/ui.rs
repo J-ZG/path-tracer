@@ -231,6 +231,22 @@ pub(super) fn run_base(
                             world.edit_skybox_average_luminance(skybox_luminance);
                         }
 
+                        let mut emission_scale = world.emission_scale();
+                        let mut response = ui.add(
+                            egui::Slider::new(&mut emission_scale, 0.0..=100_000.0)
+                                .logarithmic(true)
+                                .text("Emission scale"),
+                        );
+                        if response.drag_stopped_by(egui::PointerButton::Secondary)
+                            || response.secondary_clicked()
+                        {
+                            emission_scale = 1.0;
+                            response.mark_changed();
+                        }
+                        if response.changed() {
+                            world.edit_emission_scale(emission_scale);
+                        }
+
                         use super::path_tracer::PathTracer;
                         let response = ui.add(
                             egui::Slider::new(max_bounces, 0..=PathTracer::MAX_BOUNCES_LIMIT)

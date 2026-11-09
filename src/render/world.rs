@@ -54,6 +54,8 @@ pub(super) struct World {
     scene_uniforms: GpuSceneUniforms,
     scene_alias_table: Vec<GpuSceneAliasEntry>,
     selected_material: Option<usize>,
+    /// Factor applied to the initial emission luminance of every emissive material; see [`World::edit_emission_scale()`].
+    emission_scale: f32,
 }
 
 /// Used for internally keeping track of desired changes since the last [`World::take_updates()`] call.
@@ -220,7 +222,7 @@ pub(super) struct GpuMaterial {
     ///
     /// Intended OpenPBR counterpart identifier: `base_diffuse_roughness`. OpenPBR's default is `0.0`; in [0, 1].
     pub(super) roughness_factor: f32,
-    /// Defaults to `0.0`; in [0, 1].
+    /// Defaults to `1.0`; in [0, 1].
     pub(super) OpenPBR_emission_weight: f32,
     /// Emission color in linear RGB and emission strength in the 4th value. RGB is a linear multiplier to the emission texture; if no texture, the emission color is just this color.
     ///
@@ -603,6 +605,7 @@ impl World {
             scene_uniforms: GpuSceneUniforms::default(),
             scene_alias_table: Vec::new(),
             selected_material: None,
+            emission_scale: 1.0,
         })
     }
 
@@ -624,6 +627,7 @@ impl World {
         self.pending.scene = Some((scene, std::rc::Rc::new(())));
         self.pending.camera = None;
         self.pending.materials.clear();
+        self.emission_scale = 1.0;
         Ok(())
     }
 
@@ -645,6 +649,50 @@ impl World {
     /// Get the skybox average luminance in nits.
     pub(super) const fn skybox_average_luminance(&self) -> f32 {
         self.skybox.uniforms.average_luminance
+    }
+
+    /// Set the emission luminance of every emissive material to its initial emission luminance multiplied by `scale`.
+    ///
+    /// A material is emissive if its emission color and emission weight are both nonzero.
+    /// This overwrites emission luminance edits made to individual materials.
+    pub(super) fn edit_emission_scale(&mut self, scale: f32) {
+        let scale = scale.max(0.0);
+        self.emission_scale = scale;
+        let scene = self
+            .pending
+            .scene
+            .as_ref()
+            .map_or(&self.scene, |(scene, _)| scene);
+        for (index, (material, initial)) in scene
+            .materials
+            .iter()
+            .zip(&scene.initial.materials)
+            .enumerate()
+        {
+            let mut edited = self
+                .pending
+                .materials
+                .get(&index)
+                .copied()
+                .unwrap_or(*material);
+            if luminance(edited.emission_color_and_strength.truncate())
+                * f64::from(edited.OpenPBR_emission_weight)
+                <= 0.0
+            {
+                continue;
+            }
+            edited.emission_color_and_strength.w = initial.emission_color_and_strength.w * scale;
+            if bytemuck::bytes_of(&edited) == bytemuck::bytes_of(material) {
+                self.pending.materials.remove(&index);
+            } else {
+                self.pending.materials.insert(index, edited);
+            }
+        }
+    }
+
+    /// Get the factor last set with [`World::edit_emission_scale()`].
+    pub(super) const fn emission_scale(&self) -> f32 {
+        self.emission_scale
     }
 
     /// Get camera data.
@@ -1992,7 +2040,8 @@ impl GpuMaterial {
         #[expect(non_snake_case)]
         let mut OpenPBR_base_weight = 1.0;
         #[expect(non_snake_case)]
-        let mut OpenPBR_emission_weight = 0.0;
+        // 1.0 so that glTF emission applies by default; non-emissive materials still don't emit since emissiveFactor defaults to black
+        let mut OpenPBR_emission_weight = 1.0;
         #[expect(non_snake_case)]
         let mut OpenPBR_specular_roughness = 0.3;
         #[expect(non_snake_case)]
