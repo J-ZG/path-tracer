@@ -88,7 +88,9 @@ struct Material {
     specular_ior: f32, // glTF restricts to [1, ∞) while OpenPBR allows (0, ∞); the shading code supports this value being < 1
     specular_retroreflectivity: f32,
     normal_scale: f32,
-    pad: array<f32, 3>,
+    alpha_mode: u32,
+    alpha_cutoff: f32,
+    pad: f32,
     base_color_tex_layer: i32,
     normal_tex_layer: i32,
     metallic_roughness_tex_layer: i32,
@@ -102,6 +104,10 @@ struct Material {
     specular_color_uv: vec4f,
     specular_weight_uv: vec4f,
 }
+
+// matches the ALPHA_MODE_* constants in world.rs
+const ALPHA_MODE_OPAQUE = 0u;
+const ALPHA_MODE_MASK = 1u;
 
 struct Camera {
     position: vec4f,
@@ -383,6 +389,30 @@ fn power_heuristic(pdf: f32, other_pdf: f32) -> f32 {
     let q = other_pdf / scale;
     return p * p / (p * p + q * q);
 }
+// probability in [0, 1] that the surface exists at uv, determined by the alpha of the base color and the alpha mode
+fn coverage(mat: Material, uv: vec2f) -> f32 {
+    if mat.alpha_mode == ALPHA_MODE_OPAQUE { return 1.0; }
+    var alpha = mat.base_color.a;
+    if mat.base_color_tex_layer >= 0 {
+        // the alpha channel of a wgpu::TextureFormat::Rgba8UnormSrgb texture is always linear, as the glTF spec requires
+        alpha *= textureSampleLevel(
+            srgb_texture_atlas, atlas_sampler,
+            fma(uv, mat.base_color_uv.zw, mat.base_color_uv.xy),
+            mat.base_color_tex_layer, 0.0
+        ).a;
+    }
+    if mat.alpha_mode == ALPHA_MODE_MASK { return select(0.0, 1.0, alpha >= mat.alpha_cutoff); }
+    return alpha; // ALPHA_MODE_BLEND
+}
+// whether a ray passes through the triangle at barycentric coordinates (v, w) because the surface doesn't exist there
+// with ALPHA_MODE_BLEND, rays pass through stochastically, which converges to alpha blending
+fn passes_through(triangle_index: u32, v: f32, w: f32) -> bool {
+    let attr = attributes[triangle_index];
+    let mat = materials[attr.index];
+    if mat.alpha_mode == ALPHA_MODE_OPAQUE { return false; }
+    let uv = fract((1.0 - v - w) * attr.uv0 + v * attr.uv1 + w * attr.uv2);
+    return coverage(mat, uv) <= rand();
+}
 fn evaluate_emission(mat: Material, uv: vec2f) -> vec3f {
     var color = mat.emission_color_and_luminance.rgb;
     if mat.emission_tex_layer >= 0 {
@@ -485,7 +515,9 @@ fn sample_light(origin: vec3f) -> LightSample {
             probabilities.x * entry.selection_probability);
         let attr = attributes[entry.triangle_index];
         let uv = fract(u * attr.uv0 + v * attr.uv1 + w * attr.uv2);
-        result.emission = evaluate_emission(materials[attr.index], uv);
+        // scale by coverage since the light sample may land where the surface doesn't exist
+        let mat = materials[attr.index];
+        result.emission = coverage(mat, uv) * evaluate_emission(mat, uv);
     } else {
         let count = skybox.width * skybox.height;
         let slot = min(u32(rand() * f32(count)), count - 1u);
@@ -598,7 +630,7 @@ fn occluded(ray_origin: vec3f, ray_direction: vec3f, hit_t: f32, light_triangle_
 
                 let T = Sz * fma(U, A[kz], fma(V, B[kz], W * C[kz])) * inv_det;
 
-                if T > 0.0 && T < hit_t {
+                if T > 0.0 && T < hit_t && !passes_through(tri_index, V * inv_det, W * inv_det) {
                     return true;
                 }
             }
@@ -756,11 +788,15 @@ fn compute_main(@builtin(global_invocation_id) global_id: vec3u) {
                     let T = Sz * fma(U, A[kz], fma(V, B[kz], W * C[kz])) * inv_det;
 
                     if T > 0.0 && T < hit_t {
+                        let v = V * inv_det;
+                        let w = W * inv_det;
+                        if passes_through(tri_index, v, w) { continue; }
+
                         hit_t = T;
                         hit_index = i32(tri_index);
 
-                        hit_v = V * inv_det;
-                        hit_w = W * inv_det;
+                        hit_v = v;
+                        hit_w = w;
                     }
                 }
             } else {
@@ -849,7 +885,7 @@ fn compute_main(@builtin(global_invocation_id) global_id: vec3u) {
 
         let mat = materials[attr.index];
 
-        var base_color = mat.base_color.rgb; // OpenPBR does not allow alpha in base_color, so alpha value is not used at all even though it is included in glTF
+        var base_color = mat.base_color.rgb; // OpenPBR does not allow alpha in base_color; alpha is used only by coverage() during traversal
         let base_weight = mat.base_weight;
         var base_metalness = mat.base_metalness;
         var base_diffuse_roughness = mat.base_diffuse_roughness;
@@ -873,8 +909,7 @@ fn compute_main(@builtin(global_invocation_id) global_id: vec3u) {
                 mat.base_color_tex_layer,
                 0.0
             );
-            base_color *= base_color_tex.rgb; // for base_color texture, the alpha channel is linear per glTF spec, but OpenPBR does not specify alpha channel for base_color, so it is ignored
-            // not sure if textureSampleLevel() on a wgpu::TextureFormat::Rgba8UnormSrgb would convert the alpha channel to linear, though
+            base_color *= base_color_tex.rgb; // alpha channel is used only by coverage() during traversal
         }
         if mat.metallic_roughness_tex_layer >= 0 {
             let mr_tex = textureSampleLevel(

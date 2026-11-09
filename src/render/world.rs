@@ -27,9 +27,15 @@ pub(super) const DEFAULT_SKYBOX_LUMINANCE: f32 = 8000.0; // EXPOSURE is currentl
 /// images are packed into atlases which are larger square images that store multiple smaller images.
 /// Then, an array of atlases are passed to the GPU without problems.
 pub(super) const ATLAS_SIZE: u32 = 8192;
+
+/// [`GpuMaterial::alpha_mode`] where the surface always exists and the alpha of the base color is ignored.
+const ALPHA_MODE_OPAQUE: u32 = 0;
+/// [`GpuMaterial::alpha_mode`] where the surface exists only where the alpha of the base color is at least [`GpuMaterial::alpha_cutoff`].
+const ALPHA_MODE_MASK: u32 = 1;
+/// [`GpuMaterial::alpha_mode`] where the alpha of the base color is the probability that the surface exists.
+const ALPHA_MODE_BLEND: u32 = 2;
 // TODO: could be sized dynamically: after atlas construction, if there was only one atlas, shrink the atlas until it fits; there are multiple atlases, just use 8192
 
-// TODO: fix transparency in textures; parsing is done correctly, but shader is not correct. also, in gltf::material, parse alpha_mode and alpha_cutoff to do this properly
 // TODO: add vertex colors
 // TODO: there are lag spikes (not related to wgpu version 30), occurring at set amount of time elapsed after application first runs, which slows down frame rate by some percentage (not absolute change in frame rate)
 // TODO: render at a smaller resolution by default (maybe by somehow running an auto benchmark before anything runs to determine the user's hardware capabilities), and allow user to adjust resolution, so the app doesn't crash the user's computer
@@ -259,7 +265,18 @@ pub(super) struct GpuMaterial {
     /// No intended OpenPBR counterpart.
     pub(super) normal_scale: f32,
 
-    pad: [f32; 3],
+    /// How the alpha of the base color determines whether the surface exists: [`ALPHA_MODE_OPAQUE`], [`ALPHA_MODE_MASK`], or [`ALPHA_MODE_BLEND`].
+    ///
+    /// Parsed from [material.alphaMode](https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html#_material_alphamode).
+    alpha_mode: u32,
+    /// The surface doesn't exist where the alpha of the base color is less than this value; only used with [`ALPHA_MODE_MASK`].
+    ///
+    /// Parsed from [material.alphaCutoff](https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html#_material_alphacutoff).
+    ///
+    /// Defaults to `0.5`; in [0, ∞).
+    alpha_cutoff: f32,
+
+    pad: f32,
 
     /// Index into [`Scene::srgb_texture_atlases`] for the texture atlas containing the sRGB base color texture; `-1` if no texture.
     base_color_tex_layer: i32,
@@ -702,7 +719,7 @@ impl World {
         let mut candidate = original;
         edit(&mut candidate);
 
-        let editable_size = std::mem::offset_of!(GpuMaterial, pad);
+        let editable_size = std::mem::offset_of!(GpuMaterial, alpha_mode);
         let candidate_bytes = &bytemuck::bytes_of(&candidate)[..editable_size];
         if !bytemuck::cast_slice::<u8, f32>(candidate_bytes)
             .iter()
@@ -2062,7 +2079,14 @@ impl GpuMaterial {
             OpenPBR_specular_retroreflectivity,
             normal_scale: norm_tex.map_or(1.0, |t| t.scale()),
 
-            pad: [0.0; 3],
+            alpha_mode: match mat.alpha_mode() {
+                gltf::material::AlphaMode::Opaque => ALPHA_MODE_OPAQUE,
+                gltf::material::AlphaMode::Mask => ALPHA_MODE_MASK,
+                gltf::material::AlphaMode::Blend => ALPHA_MODE_BLEND,
+            },
+            alpha_cutoff: mat.alpha_cutoff().unwrap_or(0.5),
+
+            pad: 0.0,
 
             base_color_tex_layer,
             normal_tex_layer,
