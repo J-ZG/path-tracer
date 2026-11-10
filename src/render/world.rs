@@ -18,7 +18,7 @@ use anyhow::Context;
 /// Skybox image files usually don't store physically based values, so the average luminance computed from an imported skybox is rarely meaningful.
 /// Set a physically based value with [`World::edit_skybox_average_luminance()`] that suits the camera exposure.
 /// This value suits the exposure from the Sunny 16 rule: aperture f/16, shutter speed 1/125 s, and ISO 100.
-pub(super) const DEFAULT_SKYBOX_LUMINANCE: f32 = 8000.0; // EXPOSURE is currently set in trace.wgsl
+pub(super) const DEFAULT_SKYBOX_LUMINANCE: f32 = 8000.0; // EXPOSURE is currently set in trace.slang
 
 /// The size of each texture atlas in pixels.
 ///
@@ -39,6 +39,7 @@ const ALPHA_MODE_BLEND: u32 = 2;
 // TODO: add vertex colors
 // TODO: there are lag spikes (not related to wgpu version 30), occurring at set amount of time elapsed after application first runs, which slows down frame rate by some percentage (not absolute change in frame rate)
 // TODO: render at a smaller resolution by default (maybe by somehow running an auto benchmark before anything runs to determine the user's hardware capabilities), and allow user to adjust resolution, so the app doesn't crash the user's computer
+// TODO: add must_use for appropriate methods
 
 // TODO: finish docs
 
@@ -1705,7 +1706,7 @@ impl Scene {
                 .cross(geometry.v2.as_dvec3() - geometry.v0.as_dvec3())
                 .length()
                 * 0.5;
-            // trace.wgsl currently adds emission from both sides of every triangle.
+            // trace.slang currently adds emission from both sides of every triangle.
             let flux = std::f64::consts::TAU * area * emission;
             if flux > 0.0 && flux.is_finite() {
                 indices.push(index as u32);

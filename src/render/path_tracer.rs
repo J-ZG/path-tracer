@@ -33,7 +33,7 @@ pub(super) struct PathTracer {
     /// Layout of [`Self::display_bind_group`], needed to recreate it when the tile size changes.
     display_bind_group_layout: wgpu::BindGroupLayout,
 
-    /// Runs `trace.wgsl`, which traces one sample per pixel into the storage texture and accumulation buffer.
+    /// Runs `trace.slang` (compiled to WGSL by `build.rs`), which traces one sample per pixel into the storage texture and accumulation buffer.
     trace_pipeline: wgpu::ComputePipeline,
     /// Runs `display.wgsl`, which tone maps the storage texture onto a render target.
     display_pipeline: wgpu::RenderPipeline,
@@ -51,6 +51,9 @@ struct GpuTraceParameters {
     max_bounces: u32,
     /// Number of samples accumulated in the tile, including this sample; always at least `1` in the shader.
     sample_count: u32,
+
+    // Slang's std140 uniform layout rounds the struct size up to a multiple of 16 bytes
+    pad: [u32; 2],
 }
 
 impl PathTracer {
@@ -163,8 +166,21 @@ impl PathTracer {
                     immediate_size: 0,
                 }),
             ),
-            module: &device.create_shader_module(wgpu::include_wgsl!("trace.wgsl")),
-            entry_point: Some("compute_main"), // function name in the wgsl file
+            // SAFETY: trace.slang only indexes buffers with indices that the Rust side keeps in bounds,
+            // its BVH traversal stacks are large enough for the BVH depth, and all of its loops terminate;
+            // the runtime checks are skipped since they meaningfully slow down the shader
+            module: &unsafe {
+                device.create_shader_module_trusted(
+                    wgpu::ShaderModuleDescriptor {
+                        label: Some("trace.slang"),
+                        source: wgpu::ShaderSource::Wgsl(
+                            include_str!(concat!(env!("OUT_DIR"), "/trace.wgsl")).into(),
+                        ),
+                    },
+                    wgpu::ShaderRuntimeChecks::unchecked(),
+                )
+            },
+            entry_point: Some("compute_main"), // function name in trace.slang
             compilation_options: Default::default(),
             cache: None,
         });
@@ -220,6 +236,7 @@ impl PathTracer {
                 tile_origin: [0, 0],
                 max_bounces: Self::DEFAULT_MAX_BOUNCES,
                 sample_count: 0,
+                pad: [0; 2],
             },
             tile_size,
             parameters_buffer,
