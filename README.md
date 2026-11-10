@@ -1,7 +1,8 @@
 # [path-tracer](https://j-zg.github.io/path-tracer/)
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/J-ZG/path-tracer/refs/heads/main/doc/box_render.jpeg" style="max-height: 300px; width: auto;">
+  <img src="https://raw.githubusercontent.com/J-ZG/path-tracer/refs/heads/main/doc/box_render.jpeg" style="height: 15em;">
+  <img src="https://raw.githubusercontent.com/J-ZG/path-tracer/refs/heads/main/doc/sponza_render.jpeg" style="height: 15em">
 </p>
 
 A demo real-time 3D path tracer using WebGPU ([wgpu](https://github.com/gfx-rs/wgpu)) and Rust, implementing modern rendering techniques.
